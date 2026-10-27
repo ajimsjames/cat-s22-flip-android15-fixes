@@ -13,8 +13,8 @@
 #include <pthread.h>
 #include <errno.h>
 
-#define FB2_DEV "/dev/graphics/fb2"
-#define FB1_DEV "/dev/graphics/fb1"
+#define FB_PRIMARY "/dev/graphics/fb2"
+#define FB_SECONDARY "/dev/graphics/fb1"
 #define BL_DEV "/sys/class/leds/lcd-backlight2/brightness"
 
 static void set_backlight(int val) {
@@ -27,9 +27,7 @@ static void set_backlight(int val) {
     }
 }
 
-// -------------------------------------------------------------
-// Non-blocking Asynchronous Key Sender
-// -------------------------------------------------------------
+// Non-blocking key sender using non-blocking fork
 static void send_key_async(const char *keycmd) {
     pid_t pid = fork();
     if (pid == 0) {
@@ -263,7 +261,7 @@ static void read_system_telemetry(char *load_str, int *up_h, int *up_m) {
     }
 }
 
-// Hall sensor thread - controls main screen sleep/wake only
+// Hall sensor thread - controls inner display sleep/wake
 static void *hall_monitor_thread(void *arg) {
     (void)arg;
     for (;;) {
@@ -277,7 +275,7 @@ static void *hall_monitor_thread(void *arg) {
 
         while (fgets(buf, sizeof(buf), fp)) {
             time_t now = time(NULL);
-            if (now == last_event_time) continue; // 1-sec debounce
+            if (now == last_event_time) continue;
 
             if (strstr(buf, "hall near")) {
                 last_event_time = now;
@@ -294,13 +292,12 @@ static void *hall_monitor_thread(void *arg) {
 }
 
 int main(void) {
-    // Automatically reap child processes so no zombies remain
     signal(SIGCHLD, SIG_IGN);
 
-    // Primary outer OLED display is FB2 (128x256 / 128x128)
-    int fb_fd = open(FB2_DEV, O_RDWR);
+    // Primary outer OLED display node on Cat S22 Flip is FB2
+    int fb_fd = open(FB_PRIMARY, O_RDWR);
     if (fb_fd < 0) {
-        fb_fd = open(FB1_DEV, O_RDWR);
+        fb_fd = open(FB_SECONDARY, O_RDWR);
     }
     if (fb_fd < 0) {
         return 1;
@@ -319,10 +316,8 @@ int main(void) {
         return 1;
     }
 
-    // Always keep secondary outer backlight ON (at maximum 255)
     set_backlight(255);
 
-    // Start background kernel hall monitor thread for main screen sleep/wake
     pthread_t tid;
     pthread_create(&tid, NULL, hall_monitor_thread, NULL);
 
@@ -335,10 +330,9 @@ int main(void) {
     int wifi_on = 0;
 
     for (;;) {
-        // Refresh telemetry every 5 seconds
         if (telemetry_counter++ % 10 == 0) {
             wifi_on = get_wifi_state();
-            set_backlight(255); // Ensure backlight stays on
+            set_backlight(255);
         }
 
         // 1. Clear background
@@ -420,7 +414,7 @@ int main(void) {
         // 7. Footer Status
         draw_text(fb, 4, 116, "NET: VI INDIA [4G]", 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
 
-        ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
+        // Push directly to SPI display controller
         ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
 
         usleep(500000); // 500ms smooth update loop
