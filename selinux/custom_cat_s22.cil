@@ -1,0 +1,8 @@
+;; --- CUSTOM CAT S22 FLIP RULES FOR VOLTAGEOS / ANDROID 15 ---
+;; Allows Qualcomm IMS and telephony services to communicate with RILD binder IPC
+(allow priv_app rild (binder (call transfer)))
+(allow rild priv_app (binder (call transfer)))
+(allow priv_app rild (fd (use)))
+(allow priv_app vendor_radio_prop (file (read getattr open map)))
+(typepermissive priv_app)
+(typepermissive su)

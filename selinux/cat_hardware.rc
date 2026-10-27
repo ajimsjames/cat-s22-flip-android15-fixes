@@ -1,0 +1,19 @@
+service rezygisk_daemon /system/bin/start_rezygisk_daemon.sh
+    class late_start
+    user root
+    group root
+    seclabel u:r:su:s0
+    oneshot
+
+on boot
+    chmod 0666 /sys/class/leds/keyboard_light/brightness
+    chmod 0666 /sys/class/leds/lcd-backlight2/brightness
+    chmod 0666 /dev/shm_outerscreen_cmd
+    chmod 0666 /dev/shm_outerscreen
+
+on property:sys.boot_completed=1
+    chmod 0666 /sys/class/leds/keyboard_light/brightness
+    chmod 0666 /sys/class/leds/lcd-backlight2/brightness
+    chmod 0666 /dev/shm_outerscreen_cmd
+    chmod 0666 /dev/shm_outerscreen
+    start rezygisk_daemon

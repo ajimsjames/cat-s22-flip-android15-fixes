@@ -1,0 +1,7 @@
+*.img
+*.raw
+*.sparse.img
+*.bak
+*.log
+build/
+.gradle/
