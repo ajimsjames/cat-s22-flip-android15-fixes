@@ -13,8 +13,7 @@
 #include <pthread.h>
 #include <errno.h>
 
-#define FB_PRIMARY "/dev/graphics/fb2"
-#define FB_SECONDARY "/dev/graphics/fb1"
+#define FB_DEV "/dev/graphics/fb2"
 #define BL_DEV "/sys/class/leds/lcd-backlight2/brightness"
 
 static void set_backlight(int val) {
@@ -27,7 +26,7 @@ static void set_backlight(int val) {
     }
 }
 
-// Non-blocking key sender using non-blocking fork
+// Non-blocking asynchronous event sender
 static void send_key_async(const char *keycmd) {
     pid_t pid = fork();
     if (pid == 0) {
@@ -294,11 +293,7 @@ static void *hall_monitor_thread(void *arg) {
 int main(void) {
     signal(SIGCHLD, SIG_IGN);
 
-    // Primary outer OLED display node on Cat S22 Flip is FB2
-    int fb_fd = open(FB_PRIMARY, O_RDWR);
-    if (fb_fd < 0) {
-        fb_fd = open(FB_SECONDARY, O_RDWR);
-    }
+    int fb_fd = open(FB_DEV, O_RDWR);
     if (fb_fd < 0) {
         return 1;
     }
@@ -330,7 +325,7 @@ int main(void) {
     int wifi_on = 0;
 
     for (;;) {
-        if (telemetry_counter++ % 10 == 0) {
+        if (telemetry_counter++ % 5 == 0) {
             wifi_on = get_wifi_state();
             set_backlight(255);
         }
@@ -414,10 +409,11 @@ int main(void) {
         // 7. Footer Status
         draw_text(fb, 4, 116, "NET: VI INDIA [4G]", 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
 
-        // Push directly to SPI display controller
+        // Exactly like the proven working commit 709d673:
+        ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
         ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
 
-        usleep(500000); // 500ms smooth update loop
+        sleep(1); // Exact 1 Hz refresh (rock-solid, zero bus saturation)
     }
 
     munmap(fb, screensize);
