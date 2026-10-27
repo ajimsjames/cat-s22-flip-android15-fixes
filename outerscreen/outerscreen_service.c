@@ -1,18 +1,16 @@
 /*
- * Cat S22 Flip Outer Display Daemon
- * - 128x128 OLED Framebuffer (/dev/graphics/fb2)
- * - ALWAYS-ON secondary display:
- *     - Backlight enforced at 255 every cycle
- *     - Lid open/close events NEVER turn off outer screen
- *     - Hall sensor strictly toggles inner screen sleep/wake
- * - Brand New Cyber/Tactical OLED Watchface UI:
- *     - Top Bar: Mini Battery Gauge Block [|||| ] + Battery % + Signal indicator
- *     - Center Time: Bold High-Contrast Digital Clock with Seconds Tracker
- *     - Date Section: Clean day badge with full date
- *     - Dynamic Call HUD:
- *         - Ringing: Inverted flashing caller ID & PTT speaker answer prompt
- *         - In-Call: Live ticking timer MM:SS + speakerphone badge
- * - Rock-solid 1 Hz refresh rate: Zero kernel D-state lockups, Zero zombies.
+ * Cat S22 Flip Futuristic OLED Daemon (Cyber HUD Edition)
+ * - Display: 128x128 OLED via /dev/graphics/fb2
+ * - Always-On: Continual backlight enforcement at 255.
+ * - Hall Sensor: Strictly controls internal display sleep/wake.
+ * - Futuristic Cyberpunk HUD Design:
+ *     - Sci-Fi Corner Brackets: [┌ ┐, └ ┘]
+ *     - Status Header: Cyber telemetry (SYS:OK, 4G NET, segmented power cell gauge)
+ *     - Center Hologram Clock: High-visibility digital font with framed [:SS] micro-timer
+ *     - Telemetry Date: "28-OCT // TUE"
+ *     - Transmission/In-Call HUD:
+ *         - Incoming: Cyber transmission alert banner, caller id, PTT trigger prompt
+ *         - Active Call: Live COMM timer MM:SS, dynamic equalizer visualizer wave simulation
  */
 
 #include <stdio.h>
@@ -32,13 +30,14 @@
 
 #define COLOR_BLACK     0x00000000
 #define COLOR_WHITE     0x00FFFFFF
-#define COLOR_GRAY      0x00666666
-#define COLOR_LIGHTGRAY 0x00AAAAAA
-#define COLOR_GREEN     0x0000FF66
-#define COLOR_RED       0x00FF3333
 #define COLOR_CYAN      0x0000E5FF
+#define COLOR_NEON_BLUE 0x000099FF
+#define COLOR_GREEN     0x0000FF66
 #define COLOR_AMBER     0x00FFB300
-#define COLOR_DARKBLUE  0x000D1B2A
+#define COLOR_RED       0x00FF3333
+#define COLOR_DARKGRAY  0x00333333
+#define COLOR_MIDGRAY   0x00666666
+#define COLOR_LIGHTGRAY 0x00AAAAAA
 
 // 5x7 ASCII font table
 static const uint8_t font5x7[][5] = {
@@ -133,6 +132,10 @@ static const uint8_t font5x7[][5] = {
     ['x'] = {0x44, 0x28, 0x10, 0x28, 0x44},
     ['y'] = {0x0C, 0x50, 0x50, 0x50, 0x3C},
     ['z'] = {0x44, 0x64, 0x54, 0x4C, 0x44},
+    ['{'] = {0x00, 0x08, 0x36, 0x41, 0x00},
+    ['|'] = {0x00, 0x00, 0x7F, 0x00, 0x00},
+    ['}'] = {0x00, 0x41, 0x36, 0x08, 0x00},
+    ['~'] = {0x08, 0x08, 0x2A, 0x1C, 0x08},
 };
 
 static void draw_pixel(uint32_t *fb, int x, int y, uint32_t color) {
@@ -141,30 +144,16 @@ static void draw_pixel(uint32_t *fb, int x, int y, uint32_t color) {
     }
 }
 
-static void fill_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
-    for (int j = y; j < y + h; j++) {
-        for (int i = x; i < x + w; i++) {
-            draw_pixel(fb, i, j, color);
-        }
-    }
-}
-
-static void draw_hline(uint32_t *fb, int x, int y, int w, uint32_t color) {
-    for (int i = x; i < x + w; i++) {
-        draw_pixel(fb, i, y, color);
-    }
-}
-
 static void draw_char(uint32_t *fb, int x, int y, char c, uint32_t color, int scale) {
-    uint8_t uc = (uint8_t)c;
-    if (uc > 127) uc = '?';
+    if ((unsigned char)c > 127) c = ' ';
+    const uint8_t *glyph = font5x7[(int)c];
     for (int col = 0; col < 5; col++) {
-        uint8_t line = font5x7[uc][col];
+        uint8_t line = glyph[col];
         for (int row = 0; row < 7; row++) {
             if (line & (1 << row)) {
-                for (int dx = 0; dx < scale; dx++) {
-                    for (int dy = 0; dy < scale; dy++) {
-                        draw_pixel(fb, x + col * scale + dx, y + row * scale + dy, color);
+                for (int sx = 0; sx < scale; sx++) {
+                    for (int sy = 0; sy < scale; sy++) {
+                        draw_pixel(fb, x + col * scale + sx, y + row * scale + sy, color);
                     }
                 }
             }
@@ -182,114 +171,142 @@ static void draw_string(uint32_t *fb, int x, int y, const char *str, uint32_t co
 
 static void draw_string_centered(uint32_t *fb, int y, const char *str, uint32_t color, int scale) {
     int len = strlen(str);
-    int width = len * (5 + 1) * scale;
-    int x = (128 - width) / 2;
+    int total_width = len * 6 * scale;
+    int x = (128 - total_width) / 2;
     if (x < 0) x = 0;
     draw_string(fb, x, y, str, color, scale);
+}
+
+static void fill_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
+    for (int j = y; j < y + h; j++) {
+        for (int i = x; i < x + w; i++) {
+            draw_pixel(fb, i, j, color);
+        }
+    }
+}
+
+static void draw_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
+    for (int i = x; i < x + w; i++) {
+        draw_pixel(fb, i, y, color);
+        draw_pixel(fb, i, y + h - 1, color);
+    }
+    for (int j = y; j < y + h; j++) {
+        draw_pixel(fb, x, j, color);
+        draw_pixel(fb, x + w - 1, j, color);
+    }
+}
+
+static void draw_hline(uint32_t *fb, int x, int y, int len, uint32_t color) {
+    for (int i = 0; i < len; i++) draw_pixel(fb, x + i, y, color);
+}
+
+static void draw_vline(uint32_t *fb, int x, int y, int len, uint32_t color) {
+    for (int j = 0; j < len; j++) draw_pixel(fb, x, y + j, color);
+}
+
+// Sci-Fi Corner Brackets [┌ ┐, └ ┘]
+static void draw_sci_fi_corners(uint32_t *fb, int x, int y, int w, int h, int len, uint32_t color) {
+    // Top-left
+    draw_hline(fb, x, y, len, color);
+    draw_vline(fb, x, y, len, color);
+    // Top-right
+    draw_hline(fb, x + w - len, y, len, color);
+    draw_vline(fb, x + w - 1, y, len, color);
+    // Bottom-left
+    draw_hline(fb, x, y + h - 1, len, color);
+    draw_vline(fb, x, y + h - len, len, color);
+    // Bottom-right
+    draw_hline(fb, x + w - len, y + h - 1, len, color);
+    draw_vline(fb, x + w - 1, y + h - len, len, color);
 }
 
 static void clear_screen(uint32_t *fb) {
     memset(fb, 0, 128 * 128 * 4);
 }
 
-static void set_backlight(int val) {
+static void set_backlight(int brightness) {
     int fd = open(BACKLIGHT_NODE, O_WRONLY);
     if (fd >= 0) {
         char buf[16];
-        int len = snprintf(buf, sizeof(buf), "%d\n", val);
+        int len = snprintf(buf, sizeof(buf), "%d\n", brightness);
         write(fd, buf, len);
         close(fd);
     }
 }
 
-static void send_key_async(const char *key) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        execl("/system/bin/input", "input", "keyevent", key, (char *)NULL);
-        _exit(1);
-    }
-}
-
-static int poll_telephony(char *number_out, size_t max_len) {
-    FILE *fp = popen("dumpsys telephony.registry 2>/dev/null | grep -E 'mCallState|mCallIncomingNumber' | head -n 2", "r");
-    if (!fp) return 0;
-
-    char line[256];
-    int state = 0;
-    if (number_out && max_len > 0) number_out[0] = '\0';
-
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "mCallState")) {
-            char *p = strchr(line, '=');
-            if (p) state = atoi(p + 1);
-        } else if (strstr(line, "mCallIncomingNumber")) {
-            char *p = strchr(line, '=');
-            if (p && number_out) {
-                p++;
-                while (*p == ' ' || *p == '\t') p++;
-                size_t len = strlen(p);
-                while (len > 0 && (p[len-1] == '\n' || p[len-1] == '\r' || p[len-1] == ' ')) {
-                    p[--len] = '\0';
-                }
-                strncpy(number_out, p, max_len - 1);
-                number_out[max_len - 1] = '\0';
-            }
-        }
-    }
-    pclose(fp);
-    return state;
-}
-
-// Hall sensor thread - controls inner display sleep/wake only
-static void *hall_monitor_thread(void *arg) {
-    (void)arg;
-    for (;;) {
-        FILE *fp = popen("logcat -T 1 -v brief", "r");
-        if (!fp) {
-            sleep(1);
-            continue;
-        }
-        char buf[512];
-        time_t last_event_time = 0;
-
-        while (fgets(buf, sizeof(buf), fp)) {
-            time_t now = time(NULL);
-            if (now == last_event_time) continue;
-
-            if (strstr(buf, "hall near")) {
-                last_event_time = now;
-                send_key_async("KEYCODE_SLEEP");
-            } else if (strstr(buf, "hall far")) {
-                last_event_time = now;
-                send_key_async("KEYCODE_WAKEUP");
-            }
-        }
-        pclose(fp);
-        sleep(1);
-    }
-    return NULL;
-}
-
 static int get_battery(void) {
-    int fd = open("/sys/class/power_supply/battery/capacity", O_RDONLY);
-    if (fd < 0) return -1;
-    char buf[16] = {0};
-    read(fd, buf, sizeof(buf)-1);
-    close(fd);
-    return atoi(buf);
+    FILE *fp = fopen("/sys/class/power_supply/battery/capacity", "r");
+    if (!fp) return -1;
+    int cap = 0;
+    if (fscanf(fp, "%d", &cap) != 1) cap = -1;
+    fclose(fp);
+    return cap;
 }
 
 static int is_charging(void) {
-    int fd = open("/sys/class/power_supply/battery/status", O_RDONLY);
-    if (fd < 0) return 0;
-    char buf[32] = {0};
-    read(fd, buf, sizeof(buf)-1);
+    FILE *fp = fopen("/sys/class/power_supply/battery/status", "r");
+    if (!fp) return 0;
+    char status[32] = {0};
+    if (fscanf(fp, "%31s", status) == 1) {
+        fclose(fp);
+        return (strcmp(status, "Charging") == 0 || strcmp(status, "Full") == 0);
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int poll_telephony(char *caller_num, size_t max_len) {
+    FILE *fp = popen("dumpsys telephony.registry 2>/dev/null", "r");
+    if (!fp) return 0;
+
+    char line[256];
+    int call_state = 0; // 0 = IDLE, 1 = RINGING, 2 = OFFHOOK
+    caller_num[0] = '\0';
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "mCallState=1") || strstr(line, "mDataConnectionState=1")) {
+            call_state = 1;
+        } else if (strstr(line, "mCallState=2")) {
+            call_state = 2;
+        }
+
+        char *incoming = strstr(line, "mCallIncomingNumber=");
+        if (incoming) {
+            sscanf(incoming, "mCallIncomingNumber=%s", caller_num);
+        }
+    }
+    pclose(fp);
+    return call_state;
+}
+
+static void *hall_monitor_thread(void *arg) {
+    int fd = open("/dev/input/event0", O_RDONLY);
+    if (fd < 0) return NULL;
+
+    struct {
+        struct timeval time;
+        uint16_t type;
+        uint16_t code;
+        int32_t value;
+    } ev;
+
+    while (read(fd, &ev, sizeof(ev)) > 0) {
+        if (ev.type == 0x05 && ev.code == 0x00) { // EV_SW, SW_LID
+            if (ev.value == 1) {
+                // Lid Closed -> Internal display sleep (Outer stays lit!)
+                system("input keyevent KEYCODE_SLEEP &");
+            } else if (ev.value == 0) {
+                // Lid Opened -> Internal display wake
+                system("input keyevent KEYCODE_WAKEUP &");
+            }
+        }
+    }
     close(fd);
-    return (strstr(buf, "Charging") != NULL);
+    return NULL;
 }
 
 int main(void) {
-    signal(SIGCHLD, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
 
     int fb_fd = open(FB_DEV, O_RDWR);
     if (fb_fd < 0) return 1;
@@ -312,6 +329,7 @@ int main(void) {
 
     int last_call_state = 0;
     time_t call_start_time = 0;
+    int anim_tick = 0;
 
     for (;;) {
         // Enforce always-on outer display brightness every single second
@@ -323,101 +341,144 @@ int main(void) {
         int call_state = poll_telephony(incoming_num, sizeof(incoming_num));
 
         if (call_state == 1) {
-            /* === INCOMING CALL HUD === */
-            fill_rect(fb, 0, 0, 128, 22, COLOR_AMBER);
-            draw_string_centered(fb, 6, "INCOMING CALL", COLOR_BLACK, 1);
+            /* === CYBER TRANSMISSION ALERT HUD (INCOMING CALL) === */
+            draw_sci_fi_corners(fb, 2, 2, 124, 124, 8, COLOR_AMBER);
 
+            // Flashing header banner
+            if (anim_tick % 2 == 0) {
+                fill_rect(fb, 8, 8, 112, 16, COLOR_AMBER);
+                draw_string_centered(fb, 12, ">> TRANSMISSION <<", COLOR_BLACK, 1);
+            } else {
+                draw_rect(fb, 8, 8, 112, 16, COLOR_AMBER);
+                draw_string_centered(fb, 12, "INCOMING CALL", COLOR_AMBER, 1);
+            }
+
+            // Caller Telemetry ID
             char num_display[32];
             if (incoming_num[0]) {
-                snprintf(num_display, sizeof(num_display), "%.16s", incoming_num);
+                snprintf(num_display, sizeof(num_display), "%.15s", incoming_num);
             } else {
-                snprintf(num_display, sizeof(num_display), "Unknown");
+                snprintf(num_display, sizeof(num_display), "UNKNOWN_SRC");
             }
-            draw_string_centered(fb, 45, num_display, COLOR_WHITE, 2);
+            draw_string_centered(fb, 42, "SRC TELEMETRY:", COLOR_LIGHTGRAY, 1);
+            draw_string_centered(fb, 56, num_display, COLOR_CYAN, 2);
 
-            fill_rect(fb, 10, 82, 108, 18, COLOR_GREEN);
-            draw_string_centered(fb, 87, "HOLD PTT: ANSWER", COLOR_BLACK, 1);
+            // PTT Engagement Prompt
+            fill_rect(fb, 10, 84, 108, 16, COLOR_GREEN);
+            draw_string_centered(fb, 88, "[PTT] ENGAGE COMMS", COLOR_BLACK, 1);
 
-            draw_string_centered(fb, 108, "END: REJECT", COLOR_RED, 1);
-
+            draw_string_centered(fb, 106, "END: REJECT", COLOR_RED, 1);
             call_start_time = 0;
+
         } else if (call_state == 2) {
-            /* === ACTIVE CALL TIMER HUD === */
+            /* === ACTIVE COMMS TERMINAL HUD === */
             if (last_call_state != 2 || call_start_time == 0) {
                 call_start_time = time(NULL);
             }
             long call_duration = (long)(time(NULL) - call_start_time);
             if (call_duration < 0) call_duration = 0;
 
-            fill_rect(fb, 0, 0, 128, 20, COLOR_GREEN);
-            draw_string_centered(fb, 5, "CALL IN PROGRESS", COLOR_BLACK, 1);
+            draw_sci_fi_corners(fb, 2, 2, 124, 124, 8, COLOR_CYAN);
 
+            // Top Status Pill
+            fill_rect(fb, 12, 6, 104, 14, COLOR_GREEN);
+            draw_string_centered(fb, 9, "LIVE COMM LINK", COLOR_BLACK, 1);
+
+            // Live MM:SS Duration Timer
             char timer_buf[32];
             snprintf(timer_buf, sizeof(timer_buf), "%02ld:%02ld", call_duration / 60, call_duration % 60);
-            draw_string_centered(fb, 42, timer_buf, COLOR_CYAN, 3);
+            draw_string_centered(fb, 30, timer_buf, COLOR_WHITE, 3);
 
-            draw_string_centered(fb, 84, "[ SPEAKERPHONE ]", COLOR_WHITE, 1);
-            draw_string_centered(fb, 106, "HOLD PTT TO END", COLOR_RED, 1);
+            // Simulated Audio Frequency Wave Visualizer
+            int eq_bars[] = {4, 12, 8, 16, 22, 14, 20, 10, 18, 6, 14, 8};
+            int bar_count = sizeof(eq_bars) / sizeof(eq_bars[0]);
+            int base_y = 78;
+            for (int b = 0; b < bar_count; b++) {
+                int h = eq_bars[(b + anim_tick) % bar_count];
+                fill_rect(fb, 18 + b * 8, base_y - h / 2, 4, h, COLOR_CYAN);
+            }
+
+            draw_string_centered(fb, 88, "SPK: ROUTED ACTIVE", COLOR_NEON_BLUE, 1);
+            draw_string_centered(fb, 106, "[PTT] TERMINATE", COLOR_RED, 1);
+
         } else {
-            /* === NEW TACTICAL ALWAYS-ON WATCHFACE === */
+            /* === FUTURISTIC CYBER HUD WATCHFACE (ALWAYS-ON) === */
             call_start_time = 0;
 
             time_t now = time(NULL);
             struct tm *tm_info = localtime(&now);
 
-            // 1. TOP STATUS BAR:
-            // 4G VoLTE pill on left
-            draw_string(fb, 4, 4, "4G", COLOR_CYAN, 1);
-            draw_string(fb, 18, 4, "VoLTE", COLOR_LIGHTGRAY, 1);
+            // 1. Sci-Fi Outer Framing Brackets
+            draw_sci_fi_corners(fb, 2, 2, 124, 124, 8, COLOR_CYAN);
 
-            // Battery on right
+            // 2. Top Telemetry Header
+            draw_string(fb, 8, 6, "4G+", COLOR_CYAN, 1);
+            draw_string(fb, 28, 6, "SYS:OK", COLOR_GREEN, 1);
+
+            // Segmented Energy Cell Bar & Battery %
             int bat = get_battery();
             int chg = is_charging();
-            char bat_str[16];
+            char bat_txt[12];
             if (chg) {
-                snprintf(bat_str, sizeof(bat_str), "+%d%%", bat >= 0 ? bat : 0);
+                snprintf(bat_txt, sizeof(bat_txt), "+%d%%", bat >= 0 ? bat : 0);
             } else {
-                snprintf(bat_str, sizeof(bat_str), "%d%%", bat >= 0 ? bat : 0);
+                snprintf(bat_txt, sizeof(bat_txt), "%d%%", bat >= 0 ? bat : 0);
             }
-            draw_string(fb, 94, 4, bat_str, (bat > 20) ? COLOR_GREEN : COLOR_RED, 1);
+            draw_string(fb, 94, 6, bat_txt, (bat > 20) ? COLOR_GREEN : COLOR_RED, 1);
 
-            // Mini battery visual bar [====    ]
-            int bar_w = 24;
-            int filled_w = (bat > 0) ? (bat * bar_w / 100) : 0;
-            if (filled_w > bar_w) filled_w = bar_w;
-            fill_rect(fb, 68, 6, bar_w, 4, COLOR_GRAY);
-            if (filled_w > 0) {
-                fill_rect(fb, 68, 6, filled_w, 4, (bat > 20) ? COLOR_GREEN : COLOR_RED);
+            // 5-block energy cell gauge
+            int num_segments = 5;
+            int active_segments = (bat > 0) ? (bat * num_segments / 100) : 0;
+            if (active_segments > num_segments) active_segments = num_segments;
+            for (int s = 0; s < num_segments; s++) {
+                uint32_t seg_color = (s < active_segments) ? ((bat > 20) ? COLOR_GREEN : COLOR_RED) : COLOR_DARKGRAY;
+                fill_rect(fb, 72 + s * 4, 8, 3, 5, seg_color);
             }
 
-            draw_hline(fb, 4, 16, 120, COLOR_GRAY);
+            // Tech Divider
+            draw_hline(fb, 6, 17, 116, COLOR_MIDGRAY);
+            draw_pixel(fb, 64, 17, COLOR_CYAN); // Center focus pip
 
-            // 2. MAIN CLOCK (Bold High-Contrast HH:MM)
+            // 3. Center Holographic Clock (Large 3x Scale)
             char time_buf[16];
             strftime(time_buf, sizeof(time_buf), "%H:%M", tm_info);
-            draw_string(fb, 12, 32, time_buf, COLOR_WHITE, 3);
+            draw_string(fb, 12, 30, time_buf, COLOR_WHITE, 3);
 
-            // Seconds indicator
+            // Futuristic micro-timer box [:SS]
+            draw_rect(fb, 98, 34, 22, 18, COLOR_NEON_BLUE);
             char sec_buf[8];
             snprintf(sec_buf, sizeof(sec_buf), "%02d", tm_info->tm_sec);
-            draw_string(fb, 104, 44, sec_buf, COLOR_AMBER, 1);
+            draw_string(fb, 102, 39, sec_buf, COLOR_AMBER, 1);
 
-            // 3. DATE BADGE (Centered Day & Month)
-            draw_hline(fb, 12, 72, 104, COLOR_GRAY);
+            // Tech Sub-Divider with Accent Ticks
+            draw_hline(fb, 6, 66, 116, COLOR_MIDGRAY);
+            draw_pixel(fb, 6, 65, COLOR_CYAN);
+            draw_pixel(fb, 121, 65, COLOR_CYAN);
 
-            char day_str[16];
-            strftime(day_str, sizeof(day_str), "%A", tm_info);
-            draw_string_centered(fb, 80, day_str, COLOR_CYAN, 1);
+            // 4. Military/Aero Date Telemetry: "28-OCT // TUE"
+            char date_line[32];
+            char month_str[8], day_str[8];
+            strftime(month_str, sizeof(month_str), "%b", tm_info);
+            for (int i = 0; month_str[i]; i++) if (month_str[i] >= 'a' && month_str[i] <= 'z') month_str[i] -= 32;
+            strftime(day_str, sizeof(day_str), "%a", tm_info);
+            for (int i = 0; day_str[i]; i++) if (day_str[i] >= 'a' && day_str[i] <= 'z') day_str[i] -= 32;
 
-            char date_str[32];
-            strftime(date_str, sizeof(date_str), "%b %d, %Y", tm_info);
-            draw_string_centered(fb, 96, date_str, COLOR_LIGHTGRAY, 1);
+            snprintf(date_line, sizeof(date_line), "%02d-%s // %s", tm_info->tm_mday, month_str, day_str);
+            draw_string_centered(fb, 76, date_line, COLOR_CYAN, 1);
 
-            // 4. FOOTER STATUS
-            draw_string_centered(fb, 114, "CAT S22 FLIP", COLOR_GRAY, 1);
+            // Secondary Info Bar: "CAT-S22  ::  STANDBY"
+            draw_rect(fb, 8, 94, 112, 16, COLOR_DARKGRAY);
+            draw_string_centered(fb, 98, "CAT-S22 // STANDBY", COLOR_LIGHTGRAY, 1);
+
+            // Footer Micro Status Pips
+            for (int p = 0; p < 7; p++) {
+                uint32_t pip_color = ((anim_tick % 7) == p) ? COLOR_CYAN : COLOR_DARKGRAY;
+                draw_pixel(fb, 46 + p * 6, 118, pip_color);
+            }
         }
 
         last_call_state = call_state;
+        anim_tick++;
 
         // Commit framebuffer to display viewport
         vinfo.yoffset = 0;
