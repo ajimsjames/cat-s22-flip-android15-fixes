@@ -112,13 +112,16 @@ This repository contains the complete collection of reverse-engineered fixes, na
 
 ---
 
-### 4. Secondary Outer Display & Backlight Control
-* **The Problem:** Modern AOSP/GSIs do not natively understand dual-panel flip phone configurations; closing the flip turned off the main screen while leaving the outer display unpowered.
+### 4. Hall Sensor Flip Sleep/Wake & Secondary Outer Display Control
+* **The Problem:** 
+  1. Generic System Images do not recognize the Cat S22 Flip's hardware lid switch. Closing the flip left the main inner screen powered on and drained the battery, while opening the flip did not wake the device.
+  2. The Cat S22 Flip's kernel driver (`soc:hall` / `hall_sensor` on `input4`) emits hardware interrupts (`hall near` / `hall far`), but does not expose standard `EV_SW` `SW_LID` events to the generic Android EventHub.
+  3. The secondary outer OLED display (`/dev/graphics/fb2`) was left unpowered when the flip closed.
 * **The Solution:**
-  1. [`outerscreen_service.c`](outerscreen/outerscreen_service.c) monitors the physical hall sensor switch (`/dev/input/event3`, `EVIOCGSW`).
-  2. Directly manages the outer LCD backlight sysfs node:
-     `/sys/class/leds/lcd-backlight2/brightness`
-  3. Provides a lightweight IPC control socket (`/dev/shm_outerscreen_cmd`) supporting `FORCE_ON`, `FORCE_OFF`, and `TOGGLE` commands.
+  1. [`outerscreen_service.c`](outerscreen/outerscreen_service.c) features an integrated real-time kernel event listener monitoring the hall sensor state transitions:
+     - **Flip Closed (`hall near`):** Immediately issues `KEYCODE_SLEEP` to turn off the inner screen, powers on the outer display backlight (`/sys/class/leds/lcd-backlight2/brightness`), and renders the standalone digital clock.
+     - **Flip Opened (`hall far`):** Immediately issues `KEYCODE_WAKEUP` to wake the inner display up instantly and turns off the outer OLED backlight.
+  2. Provides an IPC control socket (`/dev/shm_outerscreen_cmd`) supporting `FORCE_ON`, `FORCE_OFF`, `BRIGHTNESS=<val>`, and `TOGGLE` commands from userland and [CatSystemManager](catsystemmanager/).
 
 ---
 

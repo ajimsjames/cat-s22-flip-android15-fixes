@@ -10,15 +10,16 @@
 #include <stdint.h>
 #include <time.h>
 #include <string.h>
+#include <pthread.h>
 
 #define FB_DEV "/dev/graphics/fb2"
 #define BL_DEV "/sys/class/leds/lcd-backlight2/brightness"
-#define HALL_DEV "/dev/input/event3"
 #define SHM_PATH "/dev/shm_outerscreen"
 #define CMD_PATH "/dev/shm_outerscreen_cmd"
 
 static int current_max_brightness = 255;
-static int force_screen_on = 1;
+static int force_screen_on = 0;
+static volatile int g_is_flip_closed = 0;
 
 static void set_backlight(int val) {
     int fd = open(BL_DEV, O_WRONLY);
@@ -65,6 +66,36 @@ static void draw_digit(uint32_t *fb, int start_x, int start_y, int digit_idx, in
     }
 }
 
+// Background thread monitoring kernel hall events
+static void *hall_monitor_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        FILE *fp = popen("logcat -T 1 -v brief", "r");
+        if (!fp) {
+            sleep(1);
+            continue;
+        }
+
+        char buf[512];
+        while (fgets(buf, sizeof(buf), fp)) {
+            if (strstr(buf, "hall near")) {
+                if (!g_is_flip_closed) {
+                    g_is_flip_closed = 1;
+                    system("input keyevent KEYCODE_SLEEP");
+                }
+            } else if (strstr(buf, "hall far")) {
+                if (g_is_flip_closed) {
+                    g_is_flip_closed = 0;
+                    system("input keyevent KEYCODE_WAKEUP");
+                }
+            }
+        }
+        pclose(fp);
+        sleep(1);
+    }
+    return NULL;
+}
+
 int main(void) {
     int fb_fd = open(FB_DEV, O_RDWR);
     if (fb_fd < 0) {
@@ -85,15 +116,6 @@ int main(void) {
 
     vinfo.activate = FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
 
-    int hall_fd = open(HALL_DEV, O_RDONLY | O_NONBLOCK);
-    int is_flip_closed = 1;
-    if (hall_fd >= 0) {
-        unsigned long swbit = 0;
-        if (ioctl(hall_fd, EVIOCGSW(sizeof(swbit)), &swbit) >= 0) {
-            is_flip_closed = (swbit & 1) ? 1 : 0;
-        }
-    }
-
     int shm_fd = open(SHM_PATH, O_CREAT | O_RDWR, 0666);
     if (shm_fd >= 0) {
         ftruncate(shm_fd, screensize + 4);
@@ -110,20 +132,14 @@ int main(void) {
         chmod(CMD_PATH, 0666);
     }
 
+    // Launch background thread to monitor hall sensor
+    pthread_t tid;
+    pthread_create(&tid, NULL, hall_monitor_thread, NULL);
+
     time_t rawtime;
     struct tm *info;
 
     for (;;) {
-        // Poll hall switch
-        if (hall_fd >= 0) {
-            struct input_event ev;
-            while (read(hall_fd, &ev, sizeof(ev)) == sizeof(ev)) {
-                if (ev.type == EV_SW && ev.code == 0) {
-                    is_flip_closed = ev.value;
-                }
-            }
-        }
-
         // Poll brightness command from CatSystemManager
         if (cmd_fd >= 0) {
             char cmd_buf[64] = {0};
@@ -153,10 +169,9 @@ int main(void) {
             }
         }
 
-        if (is_flip_closed || force_screen_on) {
+        if (g_is_flip_closed || force_screen_on) {
             set_backlight(current_max_brightness);
 
-            // If CatSystemManager sent a live frame, blit it; otherwise draw standalone clock
             if (shm_buf != NULL && shm_buf[0] == 0xCA705C22) {
                 memcpy(fb, &shm_buf[1], (128 * 128) * sizeof(uint32_t));
             } else {
@@ -183,14 +198,13 @@ int main(void) {
                 draw_digit(fb, x_base + 68, y_pos, m2, scale, 0xFFFFFFFF);
             }
 
-            // Continuous hardware SPI push
             ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
             ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
         } else {
             set_backlight(0);
         }
 
-        sleep(1);
+        usleep(250000);
     }
 
     if (shm_buf && shm_buf != MAP_FAILED) munmap(shm_buf, screensize + 4);
@@ -198,6 +212,5 @@ int main(void) {
     if (cmd_fd >= 0) close(cmd_fd);
     munmap(fb, screensize);
     close(fb_fd);
-    if (hall_fd >= 0) close(hall_fd);
     return 0;
 }
