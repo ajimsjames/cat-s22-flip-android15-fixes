@@ -7,15 +7,15 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <sys/wait.h>
 #include <linux/fb.h>
 #include <time.h>
 #include <pthread.h>
 #include <errno.h>
 
-#define FB_DEV "/dev/graphics/fb1"
+#define FB2_DEV "/dev/graphics/fb2"
+#define FB1_DEV "/dev/graphics/fb1"
 #define BL_DEV "/sys/class/leds/lcd-backlight2/brightness"
-
-static volatile int g_is_flip_closed = 0;
 
 static void set_backlight(int val) {
     int fd = open(BL_DEV, O_WRONLY);
@@ -27,11 +27,12 @@ static void set_backlight(int val) {
     }
 }
 
-// Non-blocking asynchronous event sender (no waitpid, instant exit)
+// -------------------------------------------------------------
+// Non-blocking Asynchronous Key Sender
+// -------------------------------------------------------------
 static void send_key_async(const char *keycmd) {
     pid_t pid = fork();
     if (pid == 0) {
-        // Child: send input keyevent and immediately terminate
         execl("/system/bin/input", "input", "keyevent", keycmd, (char *)NULL);
         _exit(1);
     }
@@ -174,7 +175,6 @@ static void draw_segmented_bar(uint32_t *fb, int x, int y, int width, int height
     }
 }
 
-// Draw Cellular Signal Bars (4 ascending vertical bars)
 static void draw_signal_bars(uint32_t *fb, int x, int y, int bars) {
     int heights[4] = {2, 4, 6, 8};
     for (int i = 0; i < 4; i++) {
@@ -185,7 +185,6 @@ static void draw_signal_bars(uint32_t *fb, int x, int y, int bars) {
     }
 }
 
-// Draw WiFi Icon
 static void draw_wifi_icon(uint32_t *fb, int x, int y, int active) {
     uint32_t c = active ? COL_CYAN : COL_DARK_GREEN;
     draw_line_h(fb, x, x + 8, y, c);
@@ -193,7 +192,6 @@ static void draw_wifi_icon(uint32_t *fb, int x, int y, int active) {
     draw_rect(fb, x + 3, y + 6, 3, 2, c);
 }
 
-// Non-blocking WiFi check via sysfs
 static int get_wifi_state() {
     FILE *f = fopen("/sys/class/net/wlan0/operstate", "r");
     if (f) {
@@ -207,23 +205,6 @@ static int get_wifi_state() {
     return 0;
 }
 
-// Read network operator without blocking
-static void get_network_operator(char *out, size_t max_len) {
-    // Read quick Android system prop
-    FILE *f = popen("getprop gsm.operator.alpha", "r");
-    if (f) {
-        if (fgets(out, max_len, f)) {
-            char *nl = strchr(out, '\n');
-            if (nl) *nl = 0;
-        }
-        pclose(f);
-    }
-    if (strlen(out) == 0) {
-        strncpy(out, "VI INDIA", max_len);
-    }
-}
-
-// Read battery stats
 static void read_battery(int *capacity, int *voltage_mv, int *current_ma, int *is_charging, float *temp_c) {
     *capacity = 75; *voltage_mv = 3900; *current_ma = 0; *is_charging = 0; *temp_c = 28.0f;
 
@@ -248,7 +229,6 @@ static void read_battery(int *capacity, int *voltage_mv, int *current_ma, int *i
     if (f) { int t = 0; fscanf(f, "%d", &t); *temp_c = t > 100 ? (float)t / 10.0f : (float)t; fclose(f); }
 }
 
-// Read RAM stats
 static void read_ram(int *used_mb, int *total_mb, int *used_pct) {
     *used_mb = 1100; *total_mb = 1890; *used_pct = 58;
     FILE *f = fopen("/proc/meminfo", "r");
@@ -271,7 +251,6 @@ static void read_ram(int *used_mb, int *total_mb, int *used_pct) {
     }
 }
 
-// Read CPU load and uptime
 static void read_system_telemetry(char *load_str, int *up_h, int *up_m) {
     strcpy(load_str, "0.50");
     *up_h = 0; *up_m = 0;
@@ -284,7 +263,7 @@ static void read_system_telemetry(char *load_str, int *up_h, int *up_m) {
     }
 }
 
-// Real-time kernel hall event monitor
+// Hall sensor thread - controls main screen sleep/wake only
 static void *hall_monitor_thread(void *arg) {
     (void)arg;
     for (;;) {
@@ -301,17 +280,11 @@ static void *hall_monitor_thread(void *arg) {
             if (now == last_event_time) continue; // 1-sec debounce
 
             if (strstr(buf, "hall near")) {
-                if (!g_is_flip_closed) {
-                    g_is_flip_closed = 1;
-                    last_event_time = now;
-                    send_key_async("KEYCODE_SLEEP");
-                }
+                last_event_time = now;
+                send_key_async("KEYCODE_SLEEP");
             } else if (strstr(buf, "hall far")) {
-                if (g_is_flip_closed) {
-                    g_is_flip_closed = 0;
-                    last_event_time = now;
-                    send_key_async("KEYCODE_WAKEUP");
-                }
+                last_event_time = now;
+                send_key_async("KEYCODE_WAKEUP");
             }
         }
         pclose(fp);
@@ -321,7 +294,14 @@ static void *hall_monitor_thread(void *arg) {
 }
 
 int main(void) {
-    int fb_fd = open(FB_DEV, O_RDWR);
+    // Automatically reap child processes so no zombies remain
+    signal(SIGCHLD, SIG_IGN);
+
+    // Primary outer OLED display is FB2 (128x256 / 128x128)
+    int fb_fd = open(FB2_DEV, O_RDWR);
+    if (fb_fd < 0) {
+        fb_fd = open(FB1_DEV, O_RDWR);
+    }
     if (fb_fd < 0) {
         return 1;
     }
@@ -339,7 +319,10 @@ int main(void) {
         return 1;
     }
 
-    // Start background kernel hall monitor thread
+    // Always keep secondary outer backlight ON (at maximum 255)
+    set_backlight(255);
+
+    // Start background kernel hall monitor thread for main screen sleep/wake
     pthread_t tid;
     pthread_create(&tid, NULL, hall_monitor_thread, NULL);
 
@@ -348,121 +331,99 @@ int main(void) {
     const char *days[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
     const char *months[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
 
-    int prev_closed = -1;
     int telemetry_counter = 0;
     int wifi_on = 0;
-    char carrier_name[32] = "VI INDIA";
 
     for (;;) {
-        if (g_is_flip_closed) {
-            if (prev_closed != 1) {
-                set_backlight(255);
-                prev_closed = 1;
-            }
-
-            if (telemetry_counter++ % 10 == 0) {
-                wifi_on = get_wifi_state();
-                get_network_operator(carrier_name, sizeof(carrier_name));
-            }
-
-            // 1. Clear background
-            for (int i = 0; i < 128 * 128; i++) fb[i] = COL_BG;
-
-            // Outer border
-            draw_line_h(fb, 0, 127, 0, COL_BORDER);
-            draw_line_h(fb, 0, 127, 127, COL_BORDER);
-
-            // Read battery first for top header
-            int bat_cap, bat_volt, bat_ma, is_charging;
-            float bat_temp;
-            read_battery(&bat_cap, &bat_volt, &bat_ma, &is_charging, &bat_temp);
-
-            // 2. Dynamic Top Status Bar Header
-            draw_text(fb, 4, 3, "LTE", 1, COL_GREEN);
-            draw_signal_bars(fb, 26, 3, 4);
-            draw_wifi_icon(fb, 45, 3, wifi_on);
-
-            char bat_hdr[16];
-            snprintf(bat_hdr, sizeof(bat_hdr), "%s%d%%", is_charging ? "+" : "", bat_cap);
-            int bat_hdr_x = 124 - (int)strlen(bat_hdr) * 6;
-            draw_text(fb, bat_hdr_x, 3, bat_hdr, 1, is_charging ? COL_CYAN : (bat_cap <= 20 ? COL_RED : COL_GREEN));
-            draw_line_h(fb, 1, 126, 13, COL_BORDER);
-
-            // 3. Digital Clock (HH:MM:SS) in scale 2 & Date
-            time(&rawtime);
-            info = localtime(&rawtime);
-
-            char time_str[16];
-            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", info->tm_hour, info->tm_min, info->tm_sec);
-            draw_text(fb, 14, 18, time_str, 2, COL_GREEN);
-
-            char date_str[24];
-            snprintf(date_str, sizeof(date_str), "%s %02d %s", days[info->tm_wday], info->tm_mday, months[info->tm_mon]);
-            draw_text(fb, 26, 36, date_str, 1, COL_DIM_GREEN);
-            draw_line_h(fb, 1, 126, 46, COL_BORDER);
-
-            // 4. Battery Row + Segmented Bar
-            char bat_label[24];
-            snprintf(bat_label, sizeof(bat_label), "BAT %d%%", bat_cap);
-            uint32_t bat_col = (bat_cap <= 20) ? COL_RED : COL_GREEN;
-            draw_text(fb, 4, 50, bat_label, 1, bat_col);
-
-            char bat_rate[24];
-            snprintf(bat_rate, sizeof(bat_rate), "%c%dmA", is_charging ? '+' : '-', bat_ma);
-            draw_text(fb, 76, 50, bat_rate, 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
-
-            draw_segmented_bar(fb, 4, 59, 120, 4, (float)bat_cap / 100.0f, bat_col);
-
-            // 5. RAM Row + Segmented Bar
-            int ram_used, ram_total, ram_pct;
-            read_ram(&ram_used, &ram_total, &ram_pct);
-
-            char ram_label[24];
-            snprintf(ram_label, sizeof(ram_label), "RAM %d%%", ram_pct);
-            draw_text(fb, 4, 67, ram_label, 1, COL_CYAN);
-
-            char ram_mb[24];
-            snprintf(ram_mb, sizeof(ram_mb), "%dM/%dM", ram_used, ram_total);
-            draw_text(fb, 66, 67, ram_mb, 1, COL_DIM_GREEN);
-
-            draw_segmented_bar(fb, 4, 76, 120, 4, (float)ram_pct / 100.0f, COL_CYAN);
-            draw_line_h(fb, 1, 126, 84, COL_BORDER);
-
-            // 6. Deep Hardware Telemetry
-            char volt_temp_str[32];
-            snprintf(volt_temp_str, sizeof(volt_temp_str), "V:%.2fV  T:%.0fC", (float)bat_volt / 1000.0f, bat_temp);
-            draw_text(fb, 4, 88, volt_temp_str, 1, COL_GREEN);
-
-            char load_str[8];
-            int up_h, up_m;
-            read_system_telemetry(load_str, &up_h, &up_m);
-
-            char sys_str[32];
-            snprintf(sys_str, sizeof(sys_str), "CPU:%s UP:%dh%02dm", load_str, up_h, up_m);
-            draw_text(fb, 4, 99, sys_str, 1, COL_DIM_GREEN);
-            draw_line_h(fb, 1, 126, 111, COL_BORDER);
-
-            // 7. Footer Status
-            char carrier_footer[40];
-            snprintf(carrier_footer, sizeof(carrier_footer), "NET: %s [4G]", carrier_name);
-            draw_text(fb, 4, 116, carrier_footer, 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
-
-            // Push to SPI hardware
-            ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
-            ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
-
-            usleep(500000); // 500ms snappy refresh
-        } else {
-            if (prev_closed != 0) {
-                // Clear outer screen buffer when opening flip
-                for (int i = 0; i < 128 * 128; i++) fb[i] = COL_BG;
-                ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
-                ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
-                set_backlight(0);
-                prev_closed = 0;
-            }
-            usleep(100000); // 100ms low CPU idle sleep
+        // Refresh telemetry every 5 seconds
+        if (telemetry_counter++ % 10 == 0) {
+            wifi_on = get_wifi_state();
+            set_backlight(255); // Ensure backlight stays on
         }
+
+        // 1. Clear background
+        for (int i = 0; i < 128 * 128; i++) fb[i] = COL_BG;
+
+        // Outer border
+        draw_line_h(fb, 0, 127, 0, COL_BORDER);
+        draw_line_h(fb, 0, 127, 127, COL_BORDER);
+
+        int bat_cap, bat_volt, bat_ma, is_charging;
+        float bat_temp;
+        read_battery(&bat_cap, &bat_volt, &bat_ma, &is_charging, &bat_temp);
+
+        // 2. Top Status Bar Header
+        draw_text(fb, 4, 3, "LTE", 1, COL_GREEN);
+        draw_signal_bars(fb, 26, 3, 4);
+        draw_wifi_icon(fb, 45, 3, wifi_on);
+
+        char bat_hdr[16];
+        snprintf(bat_hdr, sizeof(bat_hdr), "%s%d%%", is_charging ? "+" : "", bat_cap);
+        int bat_hdr_x = 124 - (int)strlen(bat_hdr) * 6;
+        draw_text(fb, bat_hdr_x, 3, bat_hdr, 1, is_charging ? COL_CYAN : (bat_cap <= 20 ? COL_RED : COL_GREEN));
+        draw_line_h(fb, 1, 126, 13, COL_BORDER);
+
+        // 3. Digital Clock (HH:MM:SS) in scale 2 & Date
+        time(&rawtime);
+        info = localtime(&rawtime);
+
+        char time_str[16];
+        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", info->tm_hour, info->tm_min, info->tm_sec);
+        draw_text(fb, 14, 18, time_str, 2, COL_GREEN);
+
+        char date_str[24];
+        snprintf(date_str, sizeof(date_str), "%s %02d %s", days[info->tm_wday], info->tm_mday, months[info->tm_mon]);
+        draw_text(fb, 26, 36, date_str, 1, COL_DIM_GREEN);
+        draw_line_h(fb, 1, 126, 46, COL_BORDER);
+
+        // 4. Battery Row + Segmented Bar
+        char bat_label[24];
+        snprintf(bat_label, sizeof(bat_label), "BAT %d%%", bat_cap);
+        uint32_t bat_col = (bat_cap <= 20) ? COL_RED : COL_GREEN;
+        draw_text(fb, 4, 50, bat_label, 1, bat_col);
+
+        char bat_rate[24];
+        snprintf(bat_rate, sizeof(bat_rate), "%c%dmA", is_charging ? '+' : '-', bat_ma);
+        draw_text(fb, 76, 50, bat_rate, 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
+
+        draw_segmented_bar(fb, 4, 59, 120, 4, (float)bat_cap / 100.0f, bat_col);
+
+        // 5. RAM Row + Segmented Bar
+        int ram_used, ram_total, ram_pct;
+        read_ram(&ram_used, &ram_total, &ram_pct);
+
+        char ram_label[24];
+        snprintf(ram_label, sizeof(ram_label), "RAM %d%%", ram_pct);
+        draw_text(fb, 4, 67, ram_label, 1, COL_CYAN);
+
+        char ram_mb[24];
+        snprintf(ram_mb, sizeof(ram_mb), "%dM/%dM", ram_used, ram_total);
+        draw_text(fb, 66, 67, ram_mb, 1, COL_DIM_GREEN);
+
+        draw_segmented_bar(fb, 4, 76, 120, 4, (float)ram_pct / 100.0f, COL_CYAN);
+        draw_line_h(fb, 1, 126, 84, COL_BORDER);
+
+        // 6. Deep Hardware Telemetry
+        char volt_temp_str[32];
+        snprintf(volt_temp_str, sizeof(volt_temp_str), "V:%.2fV  T:%.0fC", (float)bat_volt / 1000.0f, bat_temp);
+        draw_text(fb, 4, 88, volt_temp_str, 1, COL_GREEN);
+
+        char load_str[8];
+        int up_h, up_m;
+        read_system_telemetry(load_str, &up_h, &up_m);
+
+        char sys_str[32];
+        snprintf(sys_str, sizeof(sys_str), "CPU:%s UP:%dh%02dm", load_str, up_h, up_m);
+        draw_text(fb, 4, 99, sys_str, 1, COL_DIM_GREEN);
+        draw_line_h(fb, 1, 126, 111, COL_BORDER);
+
+        // 7. Footer Status
+        draw_text(fb, 4, 116, "NET: VI INDIA [4G]", 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
+
+        ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
+        ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
+
+        usleep(500000); // 500ms smooth update loop
     }
 
     munmap(fb, screensize);
