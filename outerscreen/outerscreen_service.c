@@ -1,16 +1,16 @@
 /*
- * Cat S22 Flip Futuristic OLED Daemon (Cyber HUD Edition)
- * - Display: 128x128 OLED via /dev/graphics/fb2
+ * Cat S22 Flip Pip-Boy Outer Display Daemon (Complete Edition)
+ * - 128x128 OLED Framebuffer (/dev/graphics/fb2)
  * - Always-On: Continual backlight enforcement at 255.
  * - Hall Sensor: Strictly controls internal display sleep/wake.
- * - Futuristic Cyberpunk HUD Design:
- *     - Sci-Fi Corner Brackets: [┌ ┐, └ ┘]
- *     - Status Header: Cyber telemetry (SYS:OK, 4G NET, segmented power cell gauge)
- *     - Center Hologram Clock: High-visibility digital font with framed [:SS] micro-timer
- *     - Telemetry Date: "28-OCT // TUE"
- *     - Transmission/In-Call HUD:
- *         - Incoming: Cyber transmission alert banner, caller id, PTT trigger prompt
- *         - Active Call: Live COMM timer MM:SS, dynamic equalizer visualizer wave simulation
+ * - Pip-Boy 3000 Vault-Tec HUD:
+ *     - Header: Cellular 4G signal bars, Wi-Fi wave icon, Hotspot beacon icon
+ *     - Center: Bold retro digital clock (HH:MM) with ticking seconds (:SS) and full date
+ *     - Gauges: Live kernel BAT%, CPU%, RAM% telemetry bars
+ *     - In-Call HUDs:
+ *         - Incoming: Amber alert header, caller ID, signal gauge, PTT answer prompt
+ *         - Active: Comms link timer MM:SS, speaker routing, animated audio equalizer wave
+ * - Pure C, zero external dependencies, zero root/Magisk required.
  */
 
 #include <stdio.h>
@@ -28,16 +28,14 @@
 #define FB_DEV          "/dev/graphics/fb2"
 #define BACKLIGHT_NODE  "/sys/class/leds/lcd-backlight2/brightness"
 
-#define COLOR_BLACK     0x00000000
-#define COLOR_WHITE     0x00FFFFFF
-#define COLOR_CYAN      0x0000E5FF
-#define COLOR_NEON_BLUE 0x000099FF
-#define COLOR_GREEN     0x0000FF66
-#define COLOR_AMBER     0x00FFB300
-#define COLOR_RED       0x00FF3333
-#define COLOR_DARKGRAY  0x00333333
-#define COLOR_MIDGRAY   0x00666666
-#define COLOR_LIGHTGRAY 0x00AAAAAA
+#define COLOR_BLACK         0x00000000
+#define COLOR_PIP_GREEN     0x0010B981 /* Phosphor green #10b981 */
+#define COLOR_PIP_LIGHT     0x00A7F3D0 /* Bright mint green #a7f3d0 */
+#define COLOR_PIP_DARK      0x00064E3B /* Dark phosphor green #064e3b */
+#define COLOR_WHITE         0x00FFFFFF
+#define COLOR_AMBER         0x00F59E0B /* Amber warning #f59e0b */
+#define COLOR_RED           0x00EF4444 /* Terminal danger red #ef4444 */
+#define COLOR_GRAY          0x00334155
 
 // 5x7 ASCII font table
 static const uint8_t font5x7[][5] = {
@@ -200,26 +198,6 @@ static void draw_hline(uint32_t *fb, int x, int y, int len, uint32_t color) {
     for (int i = 0; i < len; i++) draw_pixel(fb, x + i, y, color);
 }
 
-static void draw_vline(uint32_t *fb, int x, int y, int len, uint32_t color) {
-    for (int j = 0; j < len; j++) draw_pixel(fb, x, y + j, color);
-}
-
-// Sci-Fi Corner Brackets [┌ ┐, └ ┘]
-static void draw_sci_fi_corners(uint32_t *fb, int x, int y, int w, int h, int len, uint32_t color) {
-    // Top-left
-    draw_hline(fb, x, y, len, color);
-    draw_vline(fb, x, y, len, color);
-    // Top-right
-    draw_hline(fb, x + w - len, y, len, color);
-    draw_vline(fb, x + w - 1, y, len, color);
-    // Bottom-left
-    draw_hline(fb, x, y + h - 1, len, color);
-    draw_vline(fb, x, y + h - len, len, color);
-    // Bottom-right
-    draw_hline(fb, x + w - len, y + h - 1, len, color);
-    draw_vline(fb, x + w - 1, y + h - len, len, color);
-}
-
 static void clear_screen(uint32_t *fb) {
     memset(fb, 0, 128 * 128 * 4);
 }
@@ -234,6 +212,7 @@ static void set_backlight(int brightness) {
     }
 }
 
+/* === System & Telemetry Pollers === */
 static int get_battery(void) {
     FILE *fp = fopen("/sys/class/power_supply/battery/capacity", "r");
     if (!fp) return -1;
@@ -243,16 +222,77 @@ static int get_battery(void) {
     return cap;
 }
 
-static int is_charging(void) {
-    FILE *fp = fopen("/sys/class/power_supply/battery/status", "r");
-    if (!fp) return 0;
-    char status[32] = {0};
-    if (fscanf(fp, "%31s", status) == 1) {
+static int get_cpu_usage(void) {
+    static unsigned long long prev_user = 0, prev_nice = 0, prev_sys = 0, prev_idle = 0;
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) return 25;
+
+    unsigned long long user, nice, sys, idle;
+    char cpu_label[8];
+    if (fscanf(fp, "%s %llu %llu %llu %llu", cpu_label, &user, &nice, &sys, &idle) < 5) {
         fclose(fp);
-        return (strcmp(status, "Charging") == 0 || strcmp(status, "Full") == 0);
+        return 25;
     }
     fclose(fp);
-    return 0;
+
+    unsigned long long total_diff = (user + nice + sys + idle) - (prev_user + prev_nice + prev_sys + prev_idle);
+    unsigned long long work_diff = (user + nice + sys) - (prev_user + prev_nice + prev_sys);
+
+    prev_user = user; prev_nice = nice; prev_sys = sys; prev_idle = idle;
+
+    if (total_diff == 0) return 25;
+    int pct = (int)((work_diff * 100) / total_diff);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
+static int get_ram_usage(void) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 50;
+
+    char line[128];
+    long total_kb = 0, avail_kb = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line + 9, "%ld", &total_kb);
+        else if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line + 13, "%ld", &avail_kb);
+    }
+    fclose(fp);
+
+    if (total_kb <= 0) return 50;
+    int pct = (int)(((total_kb - avail_kb) * 100) / total_kb);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
+static int is_wifi_connected(void) {
+    FILE *fp = fopen("/proc/net/route", "r");
+    if (!fp) return 0;
+    char line[128];
+    int connected = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "wlan0")) {
+            connected = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    return connected;
+}
+
+static int is_hotspot_active(void) {
+    FILE *fp = fopen("/proc/net/arp", "r");
+    if (!fp) return 0;
+    char line[128];
+    int count = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "wlan0") && strstr(line, "0x2")) {
+            count++;
+        }
+    }
+    fclose(fp);
+    return count > 0;
 }
 
 static int poll_telephony(char *caller_num, size_t max_len) {
@@ -261,7 +301,7 @@ static int poll_telephony(char *caller_num, size_t max_len) {
 
     char line[256];
     int call_state = 0; // 0 = IDLE, 1 = RINGING, 2 = OFFHOOK
-    caller_num[0] = '\0';
+    if (caller_num && max_len > 0) caller_num[0] = '\0';
 
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, "mCallState=1") || strstr(line, "mDataConnectionState=1")) {
@@ -271,12 +311,66 @@ static int poll_telephony(char *caller_num, size_t max_len) {
         }
 
         char *incoming = strstr(line, "mCallIncomingNumber=");
-        if (incoming) {
+        if (incoming && caller_num && max_len > 0) {
             sscanf(incoming, "mCallIncomingNumber=%s", caller_num);
         }
     }
     pclose(fp);
     return call_state;
+}
+
+/* === Drawing Pip-Boy Icons === */
+static void draw_cellular_icon(uint32_t *fb, int x, int y, uint32_t color) {
+    // 4 ascending signal bars
+    fill_rect(fb, x, y + 6, 2, 2, color);
+    fill_rect(fb, x + 3, y + 4, 2, 4, color);
+    fill_rect(fb, x + 6, y + 2, 2, 6, color);
+    fill_rect(fb, x + 9, y, 2, 8, color);
+}
+
+static void draw_wifi_icon(uint32_t *fb, int x, int y, uint32_t color, int active) {
+    if (!active) {
+        draw_string(fb, x, y + 1, "xWF", COLOR_PIP_DARK, 1);
+        return;
+    }
+    // 3 concentric wave arcs + center dot
+    draw_hline(fb, x + 1, y, 7, color);
+    draw_hline(fb, x + 2, y + 2, 5, color);
+    draw_hline(fb, x + 3, y + 4, 3, color);
+    draw_pixel(fb, x + 4, y + 6, color);
+}
+
+static void draw_hotspot_icon(uint32_t *fb, int x, int y, uint32_t color, int active) {
+    if (!active) return;
+    // Broadcast beacon tower
+    draw_pixel(fb, x + 4, y + 1, color);
+    draw_pixel(fb, x + 3, y + 2, color);
+    draw_pixel(fb, x + 5, y + 2, color);
+    draw_pixel(fb, x + 2, y + 3, color);
+    draw_pixel(fb, x + 6, y + 3, color);
+    fill_rect(fb, x + 4, y + 3, 1, 5, color);
+}
+
+static void draw_telemetry_gauge(uint32_t *fb, int y, const char *label, int pct) {
+    // Label
+    draw_string(fb, 4, y, label, COLOR_PIP_LIGHT, 1);
+
+    // 10-segment bar
+    int total_segs = 10;
+    int filled = (pct * total_segs) / 100;
+    if (filled > total_segs) filled = total_segs;
+    if (filled < 0) filled = 0;
+
+    int bar_x = 32;
+    for (int s = 0; s < total_segs; s++) {
+        uint32_t seg_color = (s < filled) ? COLOR_PIP_GREEN : COLOR_PIP_DARK;
+        fill_rect(fb, bar_x + s * 6, y, 4, 7, seg_color);
+    }
+
+    // % readout
+    char val_buf[8];
+    snprintf(val_buf, sizeof(val_buf), "%3d%%", pct);
+    draw_string(fb, 98, y, val_buf, COLOR_PIP_LIGHT, 1);
 }
 
 static void *hall_monitor_thread(void *arg) {
@@ -341,146 +435,119 @@ int main(void) {
         int call_state = poll_telephony(incoming_num, sizeof(incoming_num));
 
         if (call_state == 1) {
-            /* === CYBER TRANSMISSION ALERT HUD (INCOMING CALL) === */
-            draw_sci_fi_corners(fb, 2, 2, 124, 124, 8, COLOR_AMBER);
+            /* === PIP-BOY INCOMING TRANSMISSION HUD === */
+            // Top Amber Header
+            fill_rect(fb, 0, 0, 128, 14, COLOR_AMBER);
+            draw_string_centered(fb, 3, "> TRANSMISSION <", COLOR_BLACK, 1);
 
-            // Flashing header banner
-            if (anim_tick % 2 == 0) {
-                fill_rect(fb, 8, 8, 112, 16, COLOR_AMBER);
-                draw_string_centered(fb, 12, ">> TRANSMISSION <<", COLOR_BLACK, 1);
-            } else {
-                draw_rect(fb, 8, 8, 112, 16, COLOR_AMBER);
-                draw_string_centered(fb, 12, "INCOMING CALL", COLOR_AMBER, 1);
-            }
+            // Center Telemetry Card
+            draw_string_centered(fb, 22, "INCOMING COMMS", COLOR_PIP_GREEN, 1);
 
-            // Caller Telemetry ID
             char num_display[32];
             if (incoming_num[0]) {
                 snprintf(num_display, sizeof(num_display), "%.15s", incoming_num);
             } else {
-                snprintf(num_display, sizeof(num_display), "UNKNOWN_SRC");
+                snprintf(num_display, sizeof(num_display), "UNKNOWN CALLER");
             }
-            draw_string_centered(fb, 42, "SRC TELEMETRY:", COLOR_LIGHTGRAY, 1);
-            draw_string_centered(fb, 56, num_display, COLOR_CYAN, 2);
+            draw_string_centered(fb, 40, num_display, COLOR_WHITE, 2);
 
-            // PTT Engagement Prompt
-            fill_rect(fb, 10, 84, 108, 16, COLOR_GREEN);
-            draw_string_centered(fb, 88, "[PTT] ENGAGE COMMS", COLOR_BLACK, 1);
+            // Frequency Signal Bar
+            draw_string_centered(fb, 62, "SIG: [||||||||||] 98%", COLOR_PIP_LIGHT, 1);
 
-            draw_string_centered(fb, 106, "END: REJECT", COLOR_RED, 1);
+            // PTT Action HUD
+            fill_rect(fb, 6, 82, 116, 16, COLOR_PIP_GREEN);
+            draw_string_centered(fb, 86, "HOLD [PTT]: ANSWER SPK", COLOR_BLACK, 1);
+
+            draw_string_centered(fb, 108, "RED KEY: REJECT", COLOR_RED, 1);
             call_start_time = 0;
 
         } else if (call_state == 2) {
-            /* === ACTIVE COMMS TERMINAL HUD === */
+            /* === PIP-BOY ACTIVE COMMS LINK HUD === */
             if (last_call_state != 2 || call_start_time == 0) {
                 call_start_time = time(NULL);
             }
             long call_duration = (long)(time(NULL) - call_start_time);
             if (call_duration < 0) call_duration = 0;
 
-            draw_sci_fi_corners(fb, 2, 2, 124, 124, 8, COLOR_CYAN);
+            // Top Header
+            fill_rect(fb, 0, 0, 128, 14, COLOR_PIP_GREEN);
+            draw_string(fb, 4, 3, "COMM ACTIVE", COLOR_BLACK, 1);
+            draw_string(fb, 78, 3, "SPK:ON", COLOR_BLACK, 1);
 
-            // Top Status Pill
-            fill_rect(fb, 12, 6, 104, 14, COLOR_GREEN);
-            draw_string_centered(fb, 9, "LIVE COMM LINK", COLOR_BLACK, 1);
+            // Duration Clock
+            draw_string_centered(fb, 20, "TRANSMISSION TIME", COLOR_PIP_DARK, 1);
 
-            // Live MM:SS Duration Timer
             char timer_buf[32];
             snprintf(timer_buf, sizeof(timer_buf), "%02ld:%02ld", call_duration / 60, call_duration % 60);
-            draw_string_centered(fb, 30, timer_buf, COLOR_WHITE, 3);
+            draw_string_centered(fb, 32, timer_buf, COLOR_WHITE, 3);
 
-            // Simulated Audio Frequency Wave Visualizer
-            int eq_bars[] = {4, 12, 8, 16, 22, 14, 20, 10, 18, 6, 14, 8};
-            int bar_count = sizeof(eq_bars) / sizeof(eq_bars[0]);
-            int base_y = 78;
-            for (int b = 0; b < bar_count; b++) {
-                int h = eq_bars[(b + anim_tick) % bar_count];
-                fill_rect(fb, 18 + b * 8, base_y - h / 2, 4, h, COLOR_CYAN);
+            // Animated Equalizer Wave
+            int eq_bars[] = {4, 12, 18, 8, 16, 22, 14, 10, 20, 6, 14, 8};
+            int count = sizeof(eq_bars) / sizeof(eq_bars[0]);
+            int base_y = 82;
+            for (int b = 0; b < count; b++) {
+                int h = eq_bars[(b + anim_tick) % count];
+                fill_rect(fb, 16 + b * 8, base_y - h / 2, 4, h, COLOR_PIP_GREEN);
             }
 
-            draw_string_centered(fb, 88, "SPK: ROUTED ACTIVE", COLOR_NEON_BLUE, 1);
-            draw_string_centered(fb, 106, "[PTT] TERMINATE", COLOR_RED, 1);
+            // Hangup Action
+            draw_rect(fb, 6, 100, 116, 18, COLOR_RED);
+            draw_string_centered(fb, 105, "HOLD [PTT]: END CALL", COLOR_RED, 1);
 
         } else {
-            /* === FUTURISTIC CYBER HUD WATCHFACE (ALWAYS-ON) === */
+            /* === PIP-BOY 3000 TACTICAL HUD WATCHFACE (ALWAYS-ON) === */
             call_start_time = 0;
 
             time_t now = time(NULL);
             struct tm *tm_info = localtime(&now);
 
-            // 1. Sci-Fi Outer Framing Brackets
-            draw_sci_fi_corners(fb, 2, 2, 124, 124, 8, COLOR_CYAN);
+            // 1. TOP WIRELESS STATUS BAR
+            int wifi_on = is_wifi_connected();
+            int hotspot_on = is_hotspot_active();
 
-            // 2. Top Telemetry Header
-            draw_string(fb, 8, 6, "4G+", COLOR_CYAN, 1);
-            draw_string(fb, 28, 6, "SYS:OK", COLOR_GREEN, 1);
+            draw_cellular_icon(fb, 4, 3, COLOR_PIP_GREEN);
+            draw_wifi_icon(fb, 20, 3, COLOR_PIP_GREEN, wifi_on);
+            draw_hotspot_icon(fb, 36, 3, COLOR_AMBER, hotspot_on);
 
-            // Segmented Energy Cell Bar & Battery %
-            int bat = get_battery();
-            int chg = is_charging();
-            char bat_txt[12];
-            if (chg) {
-                snprintf(bat_txt, sizeof(bat_txt), "+%d%%", bat >= 0 ? bat : 0);
-            } else {
-                snprintf(bat_txt, sizeof(bat_txt), "%d%%", bat >= 0 ? bat : 0);
-            }
-            draw_string(fb, 94, 6, bat_txt, (bat > 20) ? COLOR_GREEN : COLOR_RED, 1);
+            draw_string(fb, 56, 3, "PIP-BOY 3000", COLOR_PIP_LIGHT, 1);
+            draw_hline(fb, 2, 14, 124, COLOR_PIP_DARK);
 
-            // 5-block energy cell gauge
-            int num_segments = 5;
-            int active_segments = (bat > 0) ? (bat * num_segments / 100) : 0;
-            if (active_segments > num_segments) active_segments = num_segments;
-            for (int s = 0; s < num_segments; s++) {
-                uint32_t seg_color = (s < active_segments) ? ((bat > 20) ? COLOR_GREEN : COLOR_RED) : COLOR_DARKGRAY;
-                fill_rect(fb, 72 + s * 4, 8, 3, 5, seg_color);
-            }
-
-            // Tech Divider
-            draw_hline(fb, 6, 17, 116, COLOR_MIDGRAY);
-            draw_pixel(fb, 64, 17, COLOR_CYAN); // Center focus pip
-
-            // 3. Center Holographic Clock (Large 3x Scale)
+            // 2. CENTER HIGH-CONTRAST DIGITAL CLOCK
             char time_buf[16];
             strftime(time_buf, sizeof(time_buf), "%H:%M", tm_info);
-            draw_string(fb, 12, 30, time_buf, COLOR_WHITE, 3);
+            draw_string(fb, 10, 20, time_buf, COLOR_WHITE, 3);
 
-            // Futuristic micro-timer box [:SS]
-            draw_rect(fb, 98, 34, 22, 18, COLOR_NEON_BLUE);
+            // Seconds Pill
             char sec_buf[8];
-            snprintf(sec_buf, sizeof(sec_buf), "%02d", tm_info->tm_sec);
-            draw_string(fb, 102, 39, sec_buf, COLOR_AMBER, 1);
+            snprintf(sec_buf, sizeof(sec_buf), ":%02d", tm_info->tm_sec);
+            draw_string(fb, 102, 32, sec_buf, COLOR_PIP_GREEN, 1);
 
-            // Tech Sub-Divider with Accent Ticks
-            draw_hline(fb, 6, 66, 116, COLOR_MIDGRAY);
-            draw_pixel(fb, 6, 65, COLOR_CYAN);
-            draw_pixel(fb, 121, 65, COLOR_CYAN);
+            // Date Badge
+            char date_buf[32];
+            strftime(date_buf, sizeof(date_buf), "%a %d-%b-%Y", tm_info);
+            for (int i = 0; date_buf[i]; i++) if (date_buf[i] >= 'a' && date_buf[i] <= 'z') date_buf[i] -= 32;
+            draw_string_centered(fb, 46, date_buf, COLOR_PIP_LIGHT, 1);
+            draw_hline(fb, 2, 56, 124, COLOR_PIP_DARK);
 
-            // 4. Military/Aero Date Telemetry: "28-OCT // TUE"
-            char date_line[32];
-            char month_str[8], day_str[8];
-            strftime(month_str, sizeof(month_str), "%b", tm_info);
-            for (int i = 0; month_str[i]; i++) if (month_str[i] >= 'a' && month_str[i] <= 'z') month_str[i] -= 32;
-            strftime(day_str, sizeof(day_str), "%a", tm_info);
-            for (int i = 0; day_str[i]; i++) if (day_str[i] >= 'a' && day_str[i] <= 'z') day_str[i] -= 32;
+            // 3. TELEMETRY GAUGES: BAT%, CPU%, RAM%
+            int bat = get_battery();
+            int cpu = get_cpu_usage();
+            int ram = get_ram_usage();
 
-            snprintf(date_line, sizeof(date_line), "%02d-%s // %s", tm_info->tm_mday, month_str, day_str);
-            draw_string_centered(fb, 76, date_line, COLOR_CYAN, 1);
+            draw_telemetry_gauge(fb, 62, "BAT", bat >= 0 ? bat : 0);
+            draw_telemetry_gauge(fb, 76, "CPU", cpu);
+            draw_telemetry_gauge(fb, 90, "RAM", ram);
 
-            // Secondary Info Bar: "CAT-S22  ::  STANDBY"
-            draw_rect(fb, 8, 94, 112, 16, COLOR_DARKGRAY);
-            draw_string_centered(fb, 98, "CAT-S22 // STANDBY", COLOR_LIGHTGRAY, 1);
-
-            // Footer Micro Status Pips
-            for (int p = 0; p < 7; p++) {
-                uint32_t pip_color = ((anim_tick % 7) == p) ? COLOR_CYAN : COLOR_DARKGRAY;
-                draw_pixel(fb, 46 + p * 6, 118, pip_color);
-            }
+            // 4. FOOTER STATUS
+            draw_hline(fb, 2, 104, 124, COLOR_PIP_DARK);
+            draw_string(fb, 6, 110, "> SYS:OK", COLOR_PIP_GREEN, 1);
+            draw_string(fb, 72, 110, "CAT-S22", COLOR_PIP_DARK, 1);
         }
 
         last_call_state = call_state;
         anim_tick++;
 
-        // Commit framebuffer to display viewport
+        // Commit framebuffer
         vinfo.yoffset = 0;
         ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
 

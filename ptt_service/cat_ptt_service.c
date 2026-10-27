@@ -1,7 +1,8 @@
 /*
- * Cat S22 Flip PTT Hardware Service
- * - Reads PTT / Side button key events directly from /dev/input/event1
- * - Detects long press (>500ms):
+ * Cat S22 Flip PTT Hardware Service (Multi-Device Auto-Discovery)
+ * - Auto-detects and opens both /dev/input/event1 and uinput virtual devices
+ * - Does NOT use EVIOCGRAB so it co-exists with keypad debounce
+ * - Detects long-press (>500ms):
  *     - If incoming call (RINGING): Answers call via Speakerphone
  *     - If active call (OFFHOOK): Hangs up / ends call
  * - If idle: Short press toggles torch / flashlight
@@ -15,15 +16,16 @@
 #include <fcntl.h>
 #include <time.h>
 #include <signal.h>
+#include <poll.h>
+#include <dirent.h>
 #include <linux/input.h>
 
-#define INPUT_DEV "/dev/input/event1"
-#define PTT_KEY_CODE 248 /* KEY_MICMUTE / PTT */
-#define LONG_PRESS_MS 500
+#define PTT_KEY_CODE    248 /* KEY_MICMUTE / PTT */
+#define LONG_PRESS_MS   500
 
 static int get_call_state(char *number_out, size_t max_len) {
     /* Returns: 0 = IDLE, 1 = RINGING, 2 = OFFHOOK */
-    FILE *fp = popen("dumpsys telephony.registry | grep -E 'mCallState|mCallIncomingNumber' | head -n 2", "r");
+    FILE *fp = popen("dumpsys telephony.registry 2>/dev/null", "r");
     if (!fp) return 0;
 
     char line[256];
@@ -31,21 +33,15 @@ static int get_call_state(char *number_out, size_t max_len) {
     if (number_out && max_len > 0) number_out[0] = '\0';
 
     while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "mCallState")) {
-            char *p = strchr(line, '=');
-            if (p) state = atoi(p + 1);
-        } else if (strstr(line, "mCallIncomingNumber")) {
-            char *p = strchr(line, '=');
-            if (p && number_out) {
-                p++;
-                while (*p == ' ' || *p == '\t') p++;
-                size_t len = strlen(p);
-                while (len > 0 && (p[len-1] == '\n' || p[len-1] == '\r' || p[len-1] == ' ')) {
-                    p[--len] = '\0';
-                }
-                strncpy(number_out, p, max_len - 1);
-                number_out[max_len - 1] = '\0';
-            }
+        if (strstr(line, "mCallState=1") || strstr(line, "mDataConnectionState=1")) {
+            state = 1;
+        } else if (strstr(line, "mCallState=2")) {
+            state = 2;
+        }
+
+        char *incoming = strstr(line, "mCallIncomingNumber=");
+        if (incoming && number_out && max_len > 0) {
+            sscanf(incoming, "mCallIncomingNumber=%s", number_out);
         }
     }
     pclose(fp);
@@ -53,12 +49,12 @@ static int get_call_state(char *number_out, size_t max_len) {
 }
 
 static void trigger_speaker_answer(void) {
-    /* 1. Accept Call via telecom */
+    /* 1. Accept call */
     system("telecom accept-call 2>/dev/null || input keyevent KEYCODE_CALL");
-    usleep(300000);
-    /* 2. Route audio to speaker */
-    system("cmd media_session dispatch --key 79 2>/dev/null");
+    usleep(350000);
+    /* 2. Route speaker */
     system("service call audio 33 i32 1 2>/dev/null"); /* setSpeakerphoneOn(true) */
+    system("cmd media_session dispatch --key 79 2>/dev/null");
 }
 
 static void trigger_hangup(void) {
@@ -71,60 +67,70 @@ static void trigger_torch_toggle(void) {
 
 int main(void) {
     signal(SIGCHLD, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
 
-    int fd = -1;
-    while (fd < 0) {
-        fd = open(INPUT_DEV, O_RDONLY);
-        if (fd < 0) sleep(1);
+    /* Open all potential input event devices in non-blocking mode */
+    struct pollfd fds[16];
+    int num_fds = 0;
+
+    for (int i = 0; i < 16; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd >= 0) {
+            fds[num_fds].fd = fd;
+            fds[num_fds].events = POLLIN;
+            num_fds++;
+        }
     }
 
-    struct input_event ev;
+    if (num_fds == 0) return 1;
+
     struct timespec press_time = {0, 0};
     int is_pressed = 0;
 
     for (;;) {
-        ssize_t n = read(fd, &ev, sizeof(ev));
-        if (n < (ssize_t)sizeof(ev)) {
-            close(fd);
-            sleep(1);
-            fd = open(INPUT_DEV, O_RDONLY);
-            continue;
-        }
+        int ret = poll(fds, num_fds, 1000);
+        if (ret < 0) continue;
 
-        if (ev.type == EV_KEY && ev.code == PTT_KEY_CODE) {
-            if (ev.value == 1) { /* Key Down */
-                clock_gettime(CLOCK_MONOTONIC, &press_time);
-                is_pressed = 1;
-            } else if (ev.value == 0 && is_pressed) { /* Key Up */
-                struct timespec release_time;
-                clock_gettime(CLOCK_MONOTONIC, &release_time);
-                long elapsed_ms = (release_time.tv_sec - press_time.tv_sec) * 1000 +
-                                  (release_time.tv_nsec - press_time.tv_nsec) / 1000000;
-                is_pressed = 0;
+        for (int i = 0; i < num_fds; i++) {
+            if (fds[i].revents & POLLIN) {
+                struct input_event ev;
+                while (read(fds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                    if (ev.type == EV_KEY && ev.code == PTT_KEY_CODE) {
+                        if (ev.value == 1) { /* Key Down */
+                            clock_gettime(CLOCK_MONOTONIC, &press_time);
+                            is_pressed = 1;
+                        } else if (ev.value == 0 && is_pressed) { /* Key Up */
+                            struct timespec release_time;
+                            clock_gettime(CLOCK_MONOTONIC, &release_time);
+                            long elapsed_ms = (release_time.tv_sec - press_time.tv_sec) * 1000 +
+                                              (release_time.tv_nsec - press_time.tv_nsec) / 1000000;
+                            is_pressed = 0;
 
-                char incoming_num[64] = {0};
-                int call_state = get_call_state(incoming_num, sizeof(incoming_num));
+                            char incoming_num[64] = {0};
+                            int call_state = get_call_state(incoming_num, sizeof(incoming_num));
 
-                if (elapsed_ms >= LONG_PRESS_MS) {
-                    /* LONG PRESS DETECTED */
-                    if (call_state == 1) {
-                        /* Incoming Call -> Answer in Speakerphone mode */
-                        trigger_speaker_answer();
-                    } else if (call_state == 2) {
-                        /* Active Call -> Hang up / End Call */
-                        trigger_hangup();
-                    }
-                } else {
-                    /* SHORT PRESS */
-                    if (call_state == 0) {
-                        /* Idle -> Toggle Torch */
-                        trigger_torch_toggle();
+                            if (elapsed_ms >= LONG_PRESS_MS) {
+                                /* LONG PRESS (>500ms) */
+                                if (call_state == 1) {
+                                    trigger_speaker_answer();
+                                } else if (call_state == 2) {
+                                    trigger_hangup();
+                                }
+                            } else {
+                                /* SHORT PRESS */
+                                if (call_state == 0) {
+                                    trigger_torch_toggle();
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    close(fd);
+    for (int i = 0; i < num_fds; i++) close(fds[i].fd);
     return 0;
 }
