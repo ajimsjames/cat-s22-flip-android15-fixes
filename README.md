@@ -17,7 +17,8 @@ This repository contains the complete collection of reverse-engineered fixes, na
 │   ├── outerscreen_service.c   # Hall sensor listener & backlight daemon
 │   └── outerscreen_service     # Precompiled ARM binary
 │
-├── ims_volte/              # Qualcomm VoLTE / HD Voice Calling
+├── ims_volte/              # Qualcomm VoLTE / HD Voice Calling & VINTF Compatibility
+│   ├── compatibility_matrix.device.xml # VINTF matrix allowing Treble framework to bind vendor radio HALs
 │   ├── ims/ims.apk             # Qualcomm IMS Service (patched without crashing native libraries)
 │   └── android.hardware.telephony.ims.xml # Telephony IMS framework feature descriptor
 │
@@ -46,7 +47,41 @@ This repository contains the complete collection of reverse-engineered fixes, na
 
 ## 🛠️ Issue-by-Issue Technical Breakdown
 
-### 1. Physical Keypad Keybounce / Double-Typing Fix
+### 1. VoLTE, IMS Calling & VINTF Treble Compatibility Matrix Fix
+* **The Problem:** 
+  1. Generic System Images (GSIs) do not declare Qualcomm's proprietary radio HALs in the framework's VINTF compatibility matrix (`/system/etc/vintf/compatibility_matrix.device.xml`). As a result, Android Treble refuses to link the Android 15 telephony framework to the vendor's `rild` and `IImsRadio` HIDL services.
+  2. Qualcomm's stock `ims.apk` crashed on boot with `java.lang.UnsatisfiedLinkError: library "libimsmedia_jni.so" not found` because Android 15 lacks that legacy library.
+  3. SELinux `Enforcing` mode blocked binder IPC between `priv_app` and `rild`.
+* **The Complete Solution:**
+  1. **VINTF Compatibility Matrix Injected:** Injected [`compatibility_matrix.device.xml`](ims_volte/compatibility_matrix.device.xml) into `/system/etc/vintf/` declaring:
+     ```xml
+     <hal format="hidl" optional="true">
+         <name>vendor.qti.hardware.radio.ims</name>
+         <version>1.0-7</version>
+         <interface>
+             <name>IImsRadio</name>
+             <instance>imsradio0</instance>
+             <instance>imsradio1</instance>
+         </interface>
+     </hal>
+     <hal format="hidl" optional="true">
+         <name>vendor.qti.hardware.radio.qcrilhook</name>
+         <version>1.0</version>
+         <interface>
+             <name>IQcrilHook</name>
+             <instance>oemhook0</instance>
+             <instance>oemhook1</instance>
+         </interface>
+     </hal>
+     ```
+  2. **Patched `ims.apk`:** Disassembled `ims.apk` with `baksmali`, commented out the static call `System.loadLibrary("imsmedia_jni")` inside `ImsMedia.smali`, re-assembled with `smali`, and re-signed using the platform testkey.
+  3. **IMS Feature Descriptor:** Added [`android.hardware.telephony.ims.xml`](ims_volte/android.hardware.telephony.ims.xml) to `/system/etc/permissions/` so Android's `TelephonyRegistry` knows the hardware supports IMS.
+  4. **SELinux CIL Rules:** Injected [`custom_cat_s22.cil`](selinux/custom_cat_s22.cil) into `/system/etc/selinux/plat_sepolicy.cil` allowing binder transfer between `priv_app` and `rild`.
+* **Result:** Full 4G VoLTE Calling with the native `HD` status bar icon and bearer connectivity on Jio/Airtel/T-Mobile.
+
+---
+
+### 2. Physical Keypad Keybounce / Double-Typing Fix
 * **The Problem:** The Snapdragon 215 matrix keypad driver suffers from contact chatter/bounce, causing letters and numbers to type multiple times per physical click. When using a standard uinput virtual keyboard on bus `0x0019`, Android's `EventHub` merged the raw physical keypad and the virtual keypad into a single device, doubling the keystrokes.
 * **The Solution:**
   1. An input configuration file [`soc:matrix_keypad.idc`](keypad/soc:matrix_keypad.idc) sets `keyboard.layout = none`, muting the raw driver events in `InputReader`.
@@ -56,7 +91,9 @@ This repository contains the complete collection of reverse-engineered fixes, na
      - **Short press (< 500ms):** Emits `KEY_TAB` (`KEYCODE_TAB`) allowing instant keyboard navigation across bottom bars, action menus, and UI tabs in modern apps (such as Instagram, Chrome, and Settings) without touching the touchscreen.
      - **Long press (≥ 500ms):** Emits `KEY_MENU` (`KEYCODE_MENU`) for quick context actions.
 
-### 2. Secondary Outer Display & Backlight Control
+---
+
+### 3. Secondary Outer Display & Backlight Control
 * **The Problem:** Modern AOSP/GSIs do not natively understand dual-panel flip phone configurations; closing the flip turned off the main screen while leaving the outer display unpowered.
 * **The Solution:**
   1. [`outerscreen_service.c`](outerscreen/outerscreen_service.c) monitors the physical hall sensor switch (`/dev/input/event3`, `EVIOCGSW`).
@@ -64,12 +101,7 @@ This repository contains the complete collection of reverse-engineered fixes, na
      `/sys/class/leds/lcd-backlight2/brightness`
   3. Provides a lightweight IPC control socket (`/dev/shm_outerscreen_cmd`) supporting `FORCE_ON`, `FORCE_OFF`, and `TOGGLE` commands.
 
-### 3. VoLTE & IMS Telephony Calling
-* **The Problem:** Cat S22 Flip running Android 15 GSI lacked carrier IMS bearer negotiation, preventing outgoing/incoming 4G VoLTE calls.
-* **The Solution:**
-  1. Injected Qualcomm's proprietary IMS service [`ims.apk`](ims_volte/ims/ims.apk) (`org.codeaurora.ims`) into `/system/priv-app/ims/`.
-  2. Resolved a critical `UnsatisfiedLinkError` caused by missing `libimsmedia_jni.so` by disassembling `ims.apk` with `baksmali`, neutralizing the unused load call, and repacking with `smali`.
-  3. Added [`android.hardware.telephony.ims.xml`](ims_volte/android.hardware.telephony.ims.xml) to `/system/etc/permissions/` to register IMS telephony capabilities with Android's `TelephonyRegistry`.
+---
 
 ### 4. Megvii Face++ Biometric Face Unlock (32-Bit ARM Fix)
 * **The Problem:** VoltageOS shipped with ParanoidSense (`co.aospa.sense`), but its Face++ biometric SDK libraries were built only for 64-bit (`arm64-v8a`), causing a fatal crash during enrollment on the 32-bit Cat S22 Flip:
@@ -83,6 +115,8 @@ This repository contains the complete collection of reverse-engineered fixes, na
      - `libmegface.so`
      - `libMegviiUnlock.so`
      - `libMegviiUnlock-jni-1.2.so`
+
+---
 
 ### 5. SELinux Enforcing Compatibility
 * **The Problem:** Running Android in `Enforcing` mode blocked binder IPC between Qualcomm's `rild` radio daemon and privileged telephony apps (`priv_app`).
