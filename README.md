@@ -1,6 +1,6 @@
 # Cat S22 Flip (Android 15 / VoltageOS) Complete Fixes & Porting Guide
 
-This repository contains the complete collection of reverse-engineered fixes, native daemons, CIL SELinux policies, telephony patches, and prebuilts developed to run **Android 15 (VoltageOS GSI / Custom ROM)** smoothly on the **Cat S22 Flip** (`armeabi-v7a`, Qualcomm Snapdragon 215 / QM215).
+This repository contains the complete collection of reverse-engineered fixes, native daemons, CIL SELinux policies, telephony patches, prebuilts, and performance optimizations developed to run **Android 15 (VoltageOS GSI / Custom ROM)** smoothly on the **Cat S22 Flip** (`armeabi-v7a`, Qualcomm Snapdragon 215 / QM215).
 
 ---
 
@@ -34,6 +34,9 @@ This repository contains the complete collection of reverse-engineered fixes, na
 │   ├── privapp-permissions-cat-manager.xml  # Privileged permission whitelist
 │   └── app_source/                          # Complete Kotlin source code
 │
+├── performance/            # ART AOT & Profile-Guided Optimization scripts
+│   └── speed_optimize.sh       # Compiles core UI (SystemUI, Launcher, Settings, Dialer, PhonePe)
+│
 ├── selinux/                # SELinux Enforcing rules & boot init definitions
 │   ├── cat_hardware.rc         # Android Init script launching daemons & setting permissions
 │   └── custom_cat_s22.cil      # Custom CIL rules enabling priv_app <-> rild binder IPC
@@ -45,7 +48,7 @@ This repository contains the complete collection of reverse-engineered fixes, na
 
 ---
 
-## 🛠️ Issue-by-Issue Technical Breakdown
+## 🛠️ Complete Technical Issue-by-Issue Breakdown
 
 ### 1. VoLTE, IMS Calling & VINTF Treble Compatibility Matrix Fix
 * **The Problem:** 
@@ -81,14 +84,14 @@ This repository contains the complete collection of reverse-engineered fixes, na
 
 ---
 
-### 2. Physical Keypad Keybounce / Double-Typing Fix
-* **The Problem:** The Snapdragon 215 matrix keypad driver suffers from contact chatter/bounce, causing letters and numbers to type multiple times per physical click. When using a standard uinput virtual keyboard on bus `0x0019`, Android's `EventHub` merged the raw physical keypad and the virtual keypad into a single device, doubling the keystrokes.
+### 2. Physical Keypad Keybounce / Double-Typing & Navigation Fix
+* **The Problem:** The Snapdragon 215 matrix keypad driver suffers from contact chatter/bounce, causing letters and numbers to type multiple times per physical click. When using a standard uinput virtual keyboard on bus `0x0019`, Android's `EventHub` merged the raw physical keypad and the virtual keypad into a single device, doubling the keystrokes. Furthermore, flip phone users cannot navigate non-Dpad UI buttons (like bottom navigation bars in Instagram or web apps) without reaching for the touchscreen.
 * **The Solution:**
   1. An input configuration file [`soc:matrix_keypad.idc`](keypad/soc:matrix_keypad.idc) sets `keyboard.layout = none`, muting the raw driver events in `InputReader`.
   2. [`keypad_debounce_smart.c`](keypad/keypad_debounce_smart.c) exclusively grabs `/dev/input/event1` (`EVIOCGRAB`) and creates a clean virtual keyboard device named `Cat_Keypad_Clean` on USB bus `0x0003` (`18d1:0001`).
   3. Every key event is filtered with a strict **120ms non-blocking debounce window**.
   4. **Smart Speaker Key Navigation:**
-     - **Short press (< 500ms):** Emits `KEY_TAB` (`KEYCODE_TAB`) allowing instant keyboard navigation across bottom bars, action menus, and UI tabs in modern apps (such as Instagram, Chrome, and Settings) without touching the touchscreen.
+     - **Short press (< 500ms):** Emits `KEY_TAB` (`KEYCODE_TAB`) allowing instant keyboard navigation across bottom bars, action menus, and UI tabs in modern apps without touching the touchscreen. Once focused, pressing **Center OK** (`ENTER`) selects it!
      - **Long press (≥ 500ms):** Emits `KEY_MENU` (`KEYCODE_MENU`) for quick context actions.
 
 ---
@@ -118,8 +121,8 @@ This repository contains the complete collection of reverse-engineered fixes, na
 
 ---
 
-### 5. SELinux Enforcing Compatibility
-* **The Problem:** Running Android in `Enforcing` mode blocked binder IPC between Qualcomm's `rild` radio daemon and privileged telephony apps (`priv_app`).
+### 5. SELinux Enforcing Compatibility & File Contexts
+* **The Problem:** Running Android in `Enforcing` mode blocked binder IPC between Qualcomm's `rild` radio daemon and privileged telephony apps (`priv_app`). Furthermore, debugfs file injections into `system.img` omit extended attributes by default, causing init `execv()` permission denials.
 * **The Solution:**
   - Injected custom CIL rules [`custom_cat_s22.cil`](selinux/custom_cat_s22.cil) into `/system/etc/selinux/plat_sepolicy.cil`:
     ```cil
@@ -130,6 +133,25 @@ This repository contains the complete collection of reverse-engineered fixes, na
     (typepermissive priv_app)
     (typepermissive su)
     ```
+  - Applied explicit SELinux xattrs on all injected binaries and libraries via debugfs (`ea_set <path> security.selinux "u:object_r:system_file:s0\0"` or `system_lib_file`).
+
+---
+
+### 6. System Responsiveness & AOT Compilation (2GB RAM Optimization)
+* **The Problem:** On Snapdragon 215 with 2GB RAM, standard JIT compilation causes frame drops in launcher, dialer, and UI transitions. Attempting full AOT (`-m speed`) on large modern apps (such as PhonePe) exhausts available RAM during `dex2oat` and causes compiler crashes.
+* **The Solution:**
+  - Applied targeted compilation using [`speed_optimize.sh`](performance/speed_optimize.sh):
+    - Full AOT (`-m speed`) on critical UI packages: `com.android.systemui`, `com.android.launcher3`, `com.android.settings`, `com.android.dialer`.
+    - Profile-Guided compilation (`-m speed-profile`) on heavy applications like `com.phonepe.app` to prevent memory exhaustion while guaranteeing instantaneous app launching.
+
+---
+
+### 7. Google Play Services / Sandboxed GMS / App Store Architecture
+* **The Problem:** Attempting to install Google Services Framework (GSF) on VoltageOS threw:
+  `INSTALL_FAILED_SESSION_INVALID: GSF installation is not allowed`
+* **The Solution / Finding:**
+  - VoltageOS includes GrapheneOS's `GmsCompat` baked into the framework. `GmsCompat` internally stubs and redirects GSF and GMS calls in userland sandbox mode without needing root or system-priv GApps packages.
+  - Apps and alternative app stores (such as Aurora Store v4.7.5) operate cleanly in this environment.
 
 ---
 
