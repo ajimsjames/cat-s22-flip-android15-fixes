@@ -166,6 +166,56 @@ static void draw_segmented_bar(uint32_t *fb, int x, int y, int width, int height
     }
 }
 
+// Draw Cellular Signal Bars (4 ascending vertical bars)
+static void draw_signal_bars(uint32_t *fb, int x, int y, int bars) {
+    int heights[4] = {2, 4, 6, 8};
+    for (int i = 0; i < 4; i++) {
+        int bx = x + i * 3;
+        int by = y + (8 - heights[i]);
+        uint32_t c = (i < bars) ? COL_GREEN : COL_DARK_GREEN;
+        draw_rect(fb, bx, by, 2, heights[i], c);
+    }
+}
+
+// Draw WiFi Icon (3 arcs / dot)
+static void draw_wifi_icon(uint32_t *fb, int x, int y, int active) {
+    uint32_t c = active ? COL_CYAN : COL_DARK_GREEN;
+    // Top arc
+    draw_line_h(fb, x, x + 8, y, c);
+    // Mid arc
+    draw_line_h(fb, x + 2, x + 6, y + 3, c);
+    // Dot
+    draw_rect(fb, x + 3, y + 6, 3, 2, c);
+}
+
+// Check WiFi status directly from sysfs
+static int get_wifi_state() {
+    FILE *f = fopen("/sys/class/net/wlan0/operstate", "r");
+    if (f) {
+        char state[16] = {0};
+        fscanf(f, "%15s", state);
+        fclose(f);
+        if (strcmp(state, "up") == 0) return 1;
+    }
+    return 0;
+}
+
+// Check Cellular Signal Bars (0 - 4) from radio dumpsys
+static int get_cellular_bars() {
+    FILE *f = popen("dumpsys telephony.registry | grep -m 1 'primary=CellSignalStrength' 2>/dev/null", "r");
+    if (!f) return 3;
+    char buf[512];
+    int level = 3;
+    if (fgets(buf, sizeof(buf), f)) {
+        char *p = strstr(buf, "level=");
+        if (p) level = atoi(p + 6);
+    }
+    pclose(f);
+    if (level < 0) level = 0;
+    if (level > 4) level = 4;
+    return level;
+}
+
 // Read battery stats
 static void read_battery(int *capacity, int *voltage_mv, int *current_ma, int *is_charging, float *temp_c) {
     *capacity = 75; *voltage_mv = 3900; *current_ma = 0; *is_charging = 0; *temp_c = 28.0f;
@@ -228,15 +278,7 @@ static void read_system_telemetry(char *load_str, int *up_h, int *up_m) {
     }
 }
 
-// Non-blocking asynchronous event sender
-static void send_key_async(const char *keycmd) {
-    if (fork() == 0) {
-        execl("/system/bin/input", "input", "keyevent", keycmd, (char *)NULL);
-        _exit(1);
-    }
-}
-
-// Real-time kernel hall event monitor thread
+// Debounced Real-time kernel hall event monitor
 static void *hall_monitor_thread(void *arg) {
     (void)arg;
     for (;;) {
@@ -246,16 +288,24 @@ static void *hall_monitor_thread(void *arg) {
             continue;
         }
         char buf[512];
+        time_t last_event_time = 0;
+
         while (fgets(buf, sizeof(buf), fp)) {
+            time_t now = time(NULL);
+            // Strict 500ms debounce to prevent physical hinge bounce oscillations
+            if (now == last_event_time) continue;
+
             if (strstr(buf, "hall near")) {
                 if (!g_is_flip_closed) {
                     g_is_flip_closed = 1;
-                    send_key_async("KEYCODE_SLEEP");
+                    last_event_time = now;
+                    set_backlight(255);
                 }
             } else if (strstr(buf, "hall far")) {
                 if (g_is_flip_closed) {
                     g_is_flip_closed = 0;
-                    send_key_async("KEYCODE_WAKEUP");
+                    last_event_time = now;
+                    set_backlight(0);
                 }
             }
         }
@@ -292,25 +342,37 @@ int main(void) {
     const char *days[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
     const char *months[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
 
-    int prev_closed = -1;
+    int telemetry_counter = 0;
+    int wifi_on = 0;
+    int cell_bars = 4;
 
     for (;;) {
         if (g_is_flip_closed) {
-            if (prev_closed != 1) {
-                set_backlight(255);
-                prev_closed = 1;
+            // Update network telemetry every 5 seconds to minimize CPU
+            if (telemetry_counter++ % 10 == 0) {
+                wifi_on = get_wifi_state();
+                cell_bars = get_cellular_bars();
             }
 
             // 1. Clear background
             for (int i = 0; i < 128 * 128; i++) fb[i] = COL_BG;
 
-            // Outer border
-            draw_line_h(fb, 0, 127, 0, COL_BORDER);
-            draw_line_h(fb, 0, 127, 127, COL_BORDER);
+            // 2. STATUS BAR HEADER
+            // Carrier / Network type
+            draw_text(fb, 4, 3, "LTE", 1, COL_DIM_GREEN);
+            // Cellular signal bars
+            draw_signal_bars(fb, 26, 2, cell_bars);
+            // WiFi icon
+            draw_wifi_icon(fb, 43, 3, wifi_on);
+            // Battery icon & percentage
+            int bat_cap, bat_volt, bat_ma, is_charging;
+            float bat_temp;
+            read_battery(&bat_cap, &bat_volt, &bat_ma, &is_charging, &bat_temp);
+            char bat_top[16];
+            snprintf(bat_top, sizeof(bat_top), "%d%%%c", bat_cap, is_charging ? '+' : ' ');
+            draw_text(fb, 84, 3, bat_top, 1, is_charging ? COL_CYAN : COL_GREEN);
 
-            // 2. Header
-            draw_text(fb, 4, 3, "[ CAT OS / TELEMETRY ]", 1, COL_DIM_GREEN);
-            draw_line_h(fb, 1, 126, 12, COL_BORDER);
+            draw_line_h(fb, 1, 126, 13, COL_BORDER);
 
             // 3. Digital Clock (HH:MM:SS) & Date
             time(&rawtime);
@@ -318,28 +380,24 @@ int main(void) {
 
             char time_str[16];
             snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", info->tm_hour, info->tm_min, info->tm_sec);
-            draw_text(fb, 14, 17, time_str, 2, COL_GREEN);
+            draw_text(fb, 14, 18, time_str, 2, COL_GREEN);
 
             char date_str[24];
             snprintf(date_str, sizeof(date_str), "%s %02d %s", days[info->tm_wday], info->tm_mday, months[info->tm_mon]);
-            draw_text(fb, 26, 35, date_str, 1, COL_DIM_GREEN);
-            draw_line_h(fb, 1, 126, 45, COL_BORDER);
+            draw_text(fb, 26, 36, date_str, 1, COL_DIM_GREEN);
+            draw_line_h(fb, 1, 126, 46, COL_BORDER);
 
             // 4. Battery Row + Segmented Bar
-            int bat_cap, bat_volt, bat_ma, is_charging;
-            float bat_temp;
-            read_battery(&bat_cap, &bat_volt, &bat_ma, &is_charging, &bat_temp);
-
             char bat_label[24];
             snprintf(bat_label, sizeof(bat_label), "BAT %d%%", bat_cap);
             uint32_t bat_col = (bat_cap <= 20) ? COL_RED : COL_GREEN;
-            draw_text(fb, 4, 49, bat_label, 1, bat_col);
+            draw_text(fb, 4, 50, bat_label, 1, bat_col);
 
             char bat_rate[24];
             snprintf(bat_rate, sizeof(bat_rate), "%c%dmA", is_charging ? '+' : '-', bat_ma);
-            draw_text(fb, 76, 49, bat_rate, 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
+            draw_text(fb, 76, 50, bat_rate, 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
 
-            draw_segmented_bar(fb, 4, 58, 120, 4, (float)bat_cap / 100.0f, bat_col);
+            draw_segmented_bar(fb, 4, 59, 120, 4, (float)bat_cap / 100.0f, bat_col);
 
             // 5. RAM Row + Segmented Bar
             int ram_used, ram_total, ram_pct;
@@ -347,19 +405,19 @@ int main(void) {
 
             char ram_label[24];
             snprintf(ram_label, sizeof(ram_label), "RAM %d%%", ram_pct);
-            draw_text(fb, 4, 66, ram_label, 1, COL_CYAN);
+            draw_text(fb, 4, 67, ram_label, 1, COL_CYAN);
 
             char ram_mb[24];
             snprintf(ram_mb, sizeof(ram_mb), "%dM/%dM", ram_used, ram_total);
-            draw_text(fb, 66, 66, ram_mb, 1, COL_DIM_GREEN);
+            draw_text(fb, 66, 67, ram_mb, 1, COL_DIM_GREEN);
 
-            draw_segmented_bar(fb, 4, 75, 120, 4, (float)ram_pct / 100.0f, COL_CYAN);
-            draw_line_h(fb, 1, 126, 83, COL_BORDER);
+            draw_segmented_bar(fb, 4, 76, 120, 4, (float)ram_pct / 100.0f, COL_CYAN);
+            draw_line_h(fb, 1, 126, 84, COL_BORDER);
 
             // 6. Deep Hardware Telemetry
             char volt_temp_str[32];
             snprintf(volt_temp_str, sizeof(volt_temp_str), "V:%.2fV  T:%.0fC", (float)bat_volt / 1000.0f, bat_temp);
-            draw_text(fb, 4, 87, volt_temp_str, 1, COL_GREEN);
+            draw_text(fb, 4, 88, volt_temp_str, 1, COL_GREEN);
 
             char load_str[8];
             int up_h, up_m;
@@ -367,12 +425,12 @@ int main(void) {
 
             char sys_str[32];
             snprintf(sys_str, sizeof(sys_str), "CPU:%s UP:%dh%02dm", load_str, up_h, up_m);
-            draw_text(fb, 4, 98, sys_str, 1, COL_DIM_GREEN);
-            draw_line_h(fb, 1, 126, 110, COL_BORDER);
+            draw_text(fb, 4, 99, sys_str, 1, COL_DIM_GREEN);
+            draw_line_h(fb, 1, 126, 111, COL_BORDER);
 
-            // 7. Footer Status
-            const char *status_msg = is_charging ? "> STATUS: CHARGING [AC]" : "> STATUS: RUNNING NORMAL";
-            draw_text(fb, 4, 115, status_msg, 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
+            // 7. FOOTER (Active Carrier Network & Calling Mode)
+            // Shows carrier name and VoLTE active indicator
+            draw_text(fb, 4, 116, "NET: VI INDIA [4G/HD]", 1, COL_CYAN);
 
             // Push to SPI hardware
             ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
@@ -380,11 +438,7 @@ int main(void) {
 
             usleep(500000); // 500ms snappy refresh
         } else {
-            if (prev_closed != 0) {
-                set_backlight(0);
-                prev_closed = 0;
-            }
-            usleep(100000); // 100ms low CPU idle sleep
+            usleep(100000);
         }
     }
 
