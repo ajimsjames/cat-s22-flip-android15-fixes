@@ -1,17 +1,18 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <linux/fb.h>
-#include <stdint.h>
 #include <time.h>
-#include <string.h>
 #include <pthread.h>
+#include <errno.h>
 
-#define FB_DEV "/dev/graphics/fb2"
+#define FB_DEV "/dev/graphics/fb1"
 #define BL_DEV "/sys/class/leds/lcd-backlight2/brightness"
 
 static volatile int g_is_flip_closed = 0;
@@ -23,6 +24,16 @@ static void set_backlight(int val) {
         int len = snprintf(buf, sizeof(buf), "%d\n", val);
         write(fd, buf, len);
         close(fd);
+    }
+}
+
+// Non-blocking asynchronous event sender (no waitpid, instant exit)
+static void send_key_async(const char *keycmd) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child: send input keyevent and immediately terminate
+        execl("/system/bin/input", "input", "keyevent", keycmd, (char *)NULL);
+        _exit(1);
     }
 }
 
@@ -44,8 +55,6 @@ static void set_backlight(int val) {
 static const uint8_t font5x7[128][5] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
     ['!'] = {0x00, 0x00, 0x5F, 0x00, 0x00},
-    ['"'] = {0x00, 0x07, 0x00, 0x07, 0x00},
-    ['#'] = {0x14, 0x7F, 0x14, 0x7F, 0x14},
     ['%'] = {0x23, 0x13, 0x08, 0x64, 0x62},
     ['+'] = {0x08, 0x08, 0x3E, 0x08, 0x08},
     ['-'] = {0x08, 0x08, 0x08, 0x08, 0x08},
@@ -110,12 +119,12 @@ static void draw_char(uint32_t *fb, int x, int y, char c, int scale, uint32_t co
         uint8_t line = glyph[col];
         for (int row = 0; row < 7; row++) {
             if (line & (1 << row)) {
-                for (int dy = 0; dy < scale; dy++) {
-                    for (int dx = 0; dx < scale; dx++) {
-                        int px = x + col * scale + dx;
-                        int py = y + row * scale + dy;
+                for (int sx = 0; sx < scale; sx++) {
+                    for (int sy = 0; sy < scale; sy++) {
+                        int px = x + col * scale + sx;
+                        int py = y + row * scale + sy;
                         if (px >= 0 && px < 128 && py >= 0 && py < 128) {
-                            fb[px + py * 128] = color;
+                            fb[py * 128 + px] = color;
                         }
                     }
                 }
@@ -133,36 +142,35 @@ static void draw_text(uint32_t *fb, int x, int y, const char *str, int scale, ui
     }
 }
 
-static void draw_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
-    for (int j = y; j < y + h; j++) {
-        if (j < 0 || j >= 128) continue;
-        for (int i = x; i < x + w; i++) {
-            if (i >= 0 && i < 128) {
-                fb[i + j * 128] = color;
-            }
+static void draw_rect(uint32_t *fb, int x, int y, int width, int height, uint32_t color) {
+    for (int py = y; py < y + height; py++) {
+        if (py < 0 || py >= 128) continue;
+        for (int px = x; px < x + width; px++) {
+            if (px < 0 || px >= 128) continue;
+            fb[py * 128 + px] = color;
         }
     }
 }
 
 static void draw_line_h(uint32_t *fb, int x1, int x2, int y, uint32_t color) {
     if (y < 0 || y >= 128) return;
-    for (int x = x1; x <= x2; x++) {
-        if (x >= 0 && x < 128) fb[x + y * 128] = color;
+    for (int px = x1; px <= x2; px++) {
+        if (px >= 0 && px < 128) {
+            fb[y * 128 + px] = color;
+        }
     }
 }
 
-static void draw_segmented_bar(uint32_t *fb, int x, int y, int width, int height, float fraction, uint32_t active_color) {
-    int total_segments = 15;
-    float gap = 1.5f;
-    float seg_w = ((float)width - (gap * (total_segments - 1))) / (float)total_segments;
-    int active_segs = (int)(fraction * total_segments);
-    if (active_segs < 0) active_segs = 0;
-    if (active_segs > total_segments) active_segs = total_segments;
+static void draw_segmented_bar(uint32_t *fb, int x, int y, int width, int height, float pct, uint32_t active_color) {
+    int segments = 15;
+    int seg_w = (width - (segments - 1)) / segments;
+    int filled = (int)(pct * segments);
+    if (filled > segments) filled = segments;
 
-    for (int i = 0; i < total_segments; i++) {
-        int seg_x = x + (int)(i * (seg_w + gap));
-        uint32_t col = (i < active_segs) ? active_color : COL_DARK_GREEN;
-        draw_rect(fb, seg_x, y, (int)seg_w, height, col);
+    for (int i = 0; i < segments; i++) {
+        int seg_x = x + i * (seg_w + 1);
+        uint32_t c = (i < filled) ? active_color : COL_DARK_GREEN;
+        draw_rect(fb, seg_x, y, seg_w, height, c);
     }
 }
 
@@ -177,43 +185,42 @@ static void draw_signal_bars(uint32_t *fb, int x, int y, int bars) {
     }
 }
 
-// Draw WiFi Icon (3 arcs / dot)
+// Draw WiFi Icon
 static void draw_wifi_icon(uint32_t *fb, int x, int y, int active) {
     uint32_t c = active ? COL_CYAN : COL_DARK_GREEN;
-    // Top arc
     draw_line_h(fb, x, x + 8, y, c);
-    // Mid arc
     draw_line_h(fb, x + 2, x + 6, y + 3, c);
-    // Dot
     draw_rect(fb, x + 3, y + 6, 3, 2, c);
 }
 
-// Check WiFi status directly from sysfs
+// Non-blocking WiFi check via sysfs
 static int get_wifi_state() {
     FILE *f = fopen("/sys/class/net/wlan0/operstate", "r");
     if (f) {
         char state[16] = {0};
-        fscanf(f, "%15s", state);
+        if (fscanf(f, "%15s", state) == 1) {
+            fclose(f);
+            return (strcmp(state, "up") == 0) ? 1 : 0;
+        }
         fclose(f);
-        if (strcmp(state, "up") == 0) return 1;
     }
     return 0;
 }
 
-// Check Cellular Signal Bars (0 - 4) from radio dumpsys
-static int get_cellular_bars() {
-    FILE *f = popen("dumpsys telephony.registry | grep -m 1 'primary=CellSignalStrength' 2>/dev/null", "r");
-    if (!f) return 3;
-    char buf[512];
-    int level = 3;
-    if (fgets(buf, sizeof(buf), f)) {
-        char *p = strstr(buf, "level=");
-        if (p) level = atoi(p + 6);
+// Read network operator without blocking
+static void get_network_operator(char *out, size_t max_len) {
+    // Read quick Android system prop
+    FILE *f = popen("getprop gsm.operator.alpha", "r");
+    if (f) {
+        if (fgets(out, max_len, f)) {
+            char *nl = strchr(out, '\n');
+            if (nl) *nl = 0;
+        }
+        pclose(f);
     }
-    pclose(f);
-    if (level < 0) level = 0;
-    if (level > 4) level = 4;
-    return level;
+    if (strlen(out) == 0) {
+        strncpy(out, "VI INDIA", max_len);
+    }
 }
 
 // Read battery stats
@@ -221,20 +228,19 @@ static void read_battery(int *capacity, int *voltage_mv, int *current_ma, int *i
     *capacity = 75; *voltage_mv = 3900; *current_ma = 0; *is_charging = 0; *temp_c = 28.0f;
 
     FILE *f = fopen("/sys/class/power_supply/battery/capacity", "r");
-    if (!f) f = fopen("/sys/class/power_supply/bms/capacity", "r");
     if (f) { fscanf(f, "%d", capacity); fclose(f); }
 
     f = fopen("/sys/class/power_supply/battery/voltage_now", "r");
     if (f) { int v = 0; fscanf(f, "%d", &v); *voltage_mv = v > 100000 ? v / 1000 : v; fclose(f); }
 
     f = fopen("/sys/class/power_supply/battery/current_now", "r");
-    if (f) { int c = 0; fscanf(f, "%d", &c); *current_ma = abs(c) > 1000 ? abs(c) / 1000 : abs(c); fclose(f); }
+    if (f) { int c = 0; fscanf(f, "%d", &c); *current_ma = abs(c > 10000 ? c / 1000 : c); fclose(f); }
 
     f = fopen("/sys/class/power_supply/battery/status", "r");
     if (f) {
         char status[32] = {0};
         fscanf(f, "%31s", status);
-        if (strstr(status, "Charging")) *is_charging = 1;
+        if (strcmp(status, "Charging") == 0 || strcmp(status, "Full") == 0) *is_charging = 1;
         fclose(f);
     }
 
@@ -246,19 +252,22 @@ static void read_battery(int *capacity, int *voltage_mv, int *current_ma, int *i
 static void read_ram(int *used_mb, int *total_mb, int *used_pct) {
     *used_mb = 1100; *total_mb = 1890; *used_pct = 58;
     FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return;
-    char line[128];
-    long total = 0, avail = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line + 9, "%ld", &total);
-        else if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line + 13, "%ld", &avail);
-    }
-    fclose(f);
-    if (total > 0) {
-        *total_mb = (int)(total / 1024);
-        int avail_mb = (int)(avail / 1024);
-        *used_mb = *total_mb - avail_mb;
-        *used_pct = (*used_mb * 100) / *total_mb;
+    if (f) {
+        long total = 0, free = 0, buffers = 0, cached = 0;
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "MemTotal:", 9) == 0) total = atol(line + 9);
+            else if (strncmp(line, "MemFree:", 8) == 0) free = atol(line + 8);
+            else if (strncmp(line, "Buffers:", 8) == 0) buffers = atol(line + 8);
+            else if (strncmp(line, "Cached:", 7) == 0) cached = atol(line + 7);
+        }
+        fclose(f);
+        if (total > 0) {
+            long used = total - (free + buffers + cached);
+            *total_mb = (int)(total / 1024);
+            *used_mb = (int)(used / 1024);
+            *used_pct = (int)((used * 100) / total);
+        }
     }
 }
 
@@ -266,19 +275,16 @@ static void read_ram(int *used_mb, int *total_mb, int *used_pct) {
 static void read_system_telemetry(char *load_str, int *up_h, int *up_m) {
     strcpy(load_str, "0.50");
     *up_h = 0; *up_m = 0;
-    FILE *f = fopen("/proc/loadavg", "r");
-    if (f) {
-        fscanf(f, "%4s", load_str);
-        fclose(f);
-    }
-    struct timespec ts;
-    if (clock_gettime(CLOCK_BOOTTIME, &ts) == 0) {
-        *up_h = (int)(ts.tv_sec / 3600);
-        *up_m = (int)((ts.tv_sec % 3600) / 60);
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        float f_load = (float)si.loads[0] / 65536.0f;
+        snprintf(load_str, 8, "%.2f", f_load);
+        *up_h = si.uptime / 3600;
+        *up_m = (si.uptime % 3600) / 60;
     }
 }
 
-// Debounced Real-time kernel hall event monitor
+// Real-time kernel hall event monitor
 static void *hall_monitor_thread(void *arg) {
     (void)arg;
     for (;;) {
@@ -292,20 +298,19 @@ static void *hall_monitor_thread(void *arg) {
 
         while (fgets(buf, sizeof(buf), fp)) {
             time_t now = time(NULL);
-            // Strict 500ms debounce to prevent physical hinge bounce oscillations
-            if (now == last_event_time) continue;
+            if (now == last_event_time) continue; // 1-sec debounce
 
             if (strstr(buf, "hall near")) {
                 if (!g_is_flip_closed) {
                     g_is_flip_closed = 1;
                     last_event_time = now;
-                    set_backlight(255);
+                    send_key_async("KEYCODE_SLEEP");
                 }
             } else if (strstr(buf, "hall far")) {
                 if (g_is_flip_closed) {
                     g_is_flip_closed = 0;
                     last_event_time = now;
-                    set_backlight(0);
+                    send_key_async("KEYCODE_WAKEUP");
                 }
             }
         }
@@ -318,20 +323,21 @@ static void *hall_monitor_thread(void *arg) {
 int main(void) {
     int fb_fd = open(FB_DEV, O_RDWR);
     if (fb_fd < 0) {
-        perror("open " FB_DEV);
         return 1;
     }
 
     struct fb_var_screeninfo vinfo;
-    ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo);
-    long screensize = 128 * 128 * 4;
-    uint32_t *fb = (uint32_t *)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
-    if (fb == MAP_FAILED) {
-        perror("mmap");
+    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo)) {
         close(fb_fd);
         return 1;
     }
-    vinfo.activate = FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+
+    size_t screensize = 128 * 128 * 4;
+    uint32_t *fb = (uint32_t *)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
+    if (fb == MAP_FAILED) {
+        close(fb_fd);
+        return 1;
+    }
 
     // Start background kernel hall monitor thread
     pthread_t tid;
@@ -342,39 +348,47 @@ int main(void) {
     const char *days[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
     const char *months[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
 
+    int prev_closed = -1;
     int telemetry_counter = 0;
     int wifi_on = 0;
-    int cell_bars = 4;
+    char carrier_name[32] = "VI INDIA";
 
     for (;;) {
         if (g_is_flip_closed) {
-            // Update network telemetry every 5 seconds to minimize CPU
+            if (prev_closed != 1) {
+                set_backlight(255);
+                prev_closed = 1;
+            }
+
             if (telemetry_counter++ % 10 == 0) {
                 wifi_on = get_wifi_state();
-                cell_bars = get_cellular_bars();
+                get_network_operator(carrier_name, sizeof(carrier_name));
             }
 
             // 1. Clear background
             for (int i = 0; i < 128 * 128; i++) fb[i] = COL_BG;
 
-            // 2. STATUS BAR HEADER
-            // Carrier / Network type
-            draw_text(fb, 4, 3, "LTE", 1, COL_DIM_GREEN);
-            // Cellular signal bars
-            draw_signal_bars(fb, 26, 2, cell_bars);
-            // WiFi icon
-            draw_wifi_icon(fb, 43, 3, wifi_on);
-            // Battery icon & percentage
+            // Outer border
+            draw_line_h(fb, 0, 127, 0, COL_BORDER);
+            draw_line_h(fb, 0, 127, 127, COL_BORDER);
+
+            // Read battery first for top header
             int bat_cap, bat_volt, bat_ma, is_charging;
             float bat_temp;
             read_battery(&bat_cap, &bat_volt, &bat_ma, &is_charging, &bat_temp);
-            char bat_top[16];
-            snprintf(bat_top, sizeof(bat_top), "%d%%%c", bat_cap, is_charging ? '+' : ' ');
-            draw_text(fb, 84, 3, bat_top, 1, is_charging ? COL_CYAN : COL_GREEN);
 
+            // 2. Dynamic Top Status Bar Header
+            draw_text(fb, 4, 3, "LTE", 1, COL_GREEN);
+            draw_signal_bars(fb, 26, 3, 4);
+            draw_wifi_icon(fb, 45, 3, wifi_on);
+
+            char bat_hdr[16];
+            snprintf(bat_hdr, sizeof(bat_hdr), "%s%d%%", is_charging ? "+" : "", bat_cap);
+            int bat_hdr_x = 124 - (int)strlen(bat_hdr) * 6;
+            draw_text(fb, bat_hdr_x, 3, bat_hdr, 1, is_charging ? COL_CYAN : (bat_cap <= 20 ? COL_RED : COL_GREEN));
             draw_line_h(fb, 1, 126, 13, COL_BORDER);
 
-            // 3. Digital Clock (HH:MM:SS) & Date
+            // 3. Digital Clock (HH:MM:SS) in scale 2 & Date
             time(&rawtime);
             info = localtime(&rawtime);
 
@@ -428,9 +442,10 @@ int main(void) {
             draw_text(fb, 4, 99, sys_str, 1, COL_DIM_GREEN);
             draw_line_h(fb, 1, 126, 111, COL_BORDER);
 
-            // 7. FOOTER (Active Carrier Network & Calling Mode)
-            // Shows carrier name and VoLTE active indicator
-            draw_text(fb, 4, 116, "NET: VI INDIA [4G/HD]", 1, COL_CYAN);
+            // 7. Footer Status
+            char carrier_footer[40];
+            snprintf(carrier_footer, sizeof(carrier_footer), "NET: %s [4G]", carrier_name);
+            draw_text(fb, 4, 116, carrier_footer, 1, is_charging ? COL_CYAN : COL_DIM_GREEN);
 
             // Push to SPI hardware
             ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
@@ -438,7 +453,15 @@ int main(void) {
 
             usleep(500000); // 500ms snappy refresh
         } else {
-            usleep(100000);
+            if (prev_closed != 0) {
+                // Clear outer screen buffer when opening flip
+                for (int i = 0; i < 128 * 128; i++) fb[i] = COL_BG;
+                ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
+                ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
+                set_backlight(0);
+                prev_closed = 0;
+            }
+            usleep(100000); // 100ms low CPU idle sleep
         }
     }
 
