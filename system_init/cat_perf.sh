@@ -44,3 +44,9 @@ resetprop_phh persist.sys.phh.ims.floss false
 
 # 6. Display Density & Compact UI Metrics
 wm density 210 2>/dev/null
+
+# 7. VoltageOS Custom Branding & Attribution
+setprop ro.voltage.maintainer "GSI modded for CAT S22 FLIP by ajugeorge"
+setprop ro.voltage.build.status "COMMUNITY"
+setprop ro.voltage.version "VoltageOS-4.4-CAT-S22-ajugeorge"
+
