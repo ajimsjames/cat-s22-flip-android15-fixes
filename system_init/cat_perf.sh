@@ -46,7 +46,17 @@ resetprop_phh persist.sys.phh.ims.floss false
 wm density 210 2>/dev/null
 
 # 7. VoltageOS Custom Branding & Attribution
-setprop ro.voltage.maintainer "GSI modded for CAT S22 FLIP by ajugeorge"
-setprop ro.voltage.build.status "COMMUNITY"
+# Settings.apk VoltageMaintainerPreferenceController:
+# summary = getBuildStatus() + " by " + getString(R.string.voltage_maintainer)
+# When ro.voltage.build.status is set, getBuildStatus() returns that exact string.
+# Overlay overrides R.string.voltage_maintainer to "ajugeorge".
+# Combined summary display: "GSI modded for CAT S22 FLIP by ajugeorge"
+resetprop_phh ro.voltage.build.status "GSI modded for CAT S22 FLIP"
+resetprop_phh ro.voltage.buildtype "GSI modded for CAT S22 FLIP"
+resetprop_phh ro.voltage.maintainer "ajugeorge"
+resetprop_phh ro.voltage.version "VoltageOS-4.4-CAT-S22-ajugeorge"
+setprop ro.voltage.build.status "GSI modded for CAT S22 FLIP"
+setprop ro.voltage.buildtype "GSI modded for CAT S22 FLIP"
+setprop ro.voltage.maintainer "ajugeorge"
 setprop ro.voltage.version "VoltageOS-4.4-CAT-S22-ajugeorge"
 
