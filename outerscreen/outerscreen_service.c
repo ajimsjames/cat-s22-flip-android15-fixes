@@ -39,7 +39,7 @@ static void set_backlight(int val) {
 #define COL_BORDER     0xFF00421A // Subtle Terminal Border
 
 // -------------------------------------------------------------
-// Embedded 5x7 Monospace Font (Digits, Uppercase, Punctuation)
+// Embedded 5x7 Monospace Font
 // -------------------------------------------------------------
 static const uint8_t font5x7[128][5] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
@@ -128,7 +128,7 @@ static void draw_text(uint32_t *fb, int x, int y, const char *str, int scale, ui
     int cur_x = x;
     while (*str) {
         draw_char(fb, cur_x, y, *str, scale, color);
-        cur_x += 6 * scale; // 5 width + 1 pixel gap
+        cur_x += 6 * scale;
         str++;
     }
 }
@@ -166,7 +166,7 @@ static void draw_segmented_bar(uint32_t *fb, int x, int y, int width, int height
     }
 }
 
-// Read battery capacity, voltage, and charging status
+// Read battery stats
 static void read_battery(int *capacity, int *voltage_mv, int *current_ma, int *is_charging, float *temp_c) {
     *capacity = 75; *voltage_mv = 3900; *current_ma = 0; *is_charging = 0; *temp_c = 28.0f;
 
@@ -192,7 +192,7 @@ static void read_battery(int *capacity, int *voltage_mv, int *current_ma, int *i
     if (f) { int t = 0; fscanf(f, "%d", &t); *temp_c = t > 100 ? (float)t / 10.0f : (float)t; fclose(f); }
 }
 
-// Read RAM metrics from /proc/meminfo
+// Read RAM stats
 static void read_ram(int *used_mb, int *total_mb, int *used_pct) {
     *used_mb = 1100; *total_mb = 1890; *used_pct = 58;
     FILE *f = fopen("/proc/meminfo", "r");
@@ -212,7 +212,7 @@ static void read_ram(int *used_mb, int *total_mb, int *used_pct) {
     }
 }
 
-// Read CPU load average and system uptime
+// Read CPU load and uptime
 static void read_system_telemetry(char *load_str, int *up_h, int *up_m) {
     strcpy(load_str, "0.50");
     *up_h = 0; *up_m = 0;
@@ -228,7 +228,15 @@ static void read_system_telemetry(char *load_str, int *up_h, int *up_m) {
     }
 }
 
-// Real-time kernel hall event monitor
+// Non-blocking asynchronous event sender
+static void send_key_async(const char *keycmd) {
+    if (fork() == 0) {
+        execl("/system/bin/input", "input", "keyevent", keycmd, (char *)NULL);
+        _exit(1);
+    }
+}
+
+// Real-time kernel hall event monitor thread
 static void *hall_monitor_thread(void *arg) {
     (void)arg;
     for (;;) {
@@ -242,12 +250,12 @@ static void *hall_monitor_thread(void *arg) {
             if (strstr(buf, "hall near")) {
                 if (!g_is_flip_closed) {
                     g_is_flip_closed = 1;
-                    system("input keyevent KEYCODE_SLEEP");
+                    send_key_async("KEYCODE_SLEEP");
                 }
             } else if (strstr(buf, "hall far")) {
                 if (g_is_flip_closed) {
                     g_is_flip_closed = 0;
-                    system("input keyevent KEYCODE_WAKEUP");
+                    send_key_async("KEYCODE_WAKEUP");
                 }
             }
         }
@@ -284,9 +292,14 @@ int main(void) {
     const char *days[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
     const char *months[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
 
+    int prev_closed = -1;
+
     for (;;) {
         if (g_is_flip_closed) {
-            set_backlight(255);
+            if (prev_closed != 1) {
+                set_backlight(255);
+                prev_closed = 1;
+            }
 
             // 1. Clear background
             for (int i = 0; i < 128 * 128; i++) fb[i] = COL_BG;
@@ -299,7 +312,7 @@ int main(void) {
             draw_text(fb, 4, 3, "[ CAT OS / TELEMETRY ]", 1, COL_DIM_GREEN);
             draw_line_h(fb, 1, 126, 12, COL_BORDER);
 
-            // 3. Digital Clock (HH:MM:SS) in scale 2 & Date
+            // 3. Digital Clock (HH:MM:SS) & Date
             time(&rawtime);
             info = localtime(&rawtime);
 
@@ -364,11 +377,15 @@ int main(void) {
             // Push to SPI hardware
             ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
             ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
-        } else {
-            set_backlight(0);
-        }
 
-        sleep(1); // 1 Hz refresh when flip is closed
+            usleep(500000); // 500ms snappy refresh
+        } else {
+            if (prev_closed != 0) {
+                set_backlight(0);
+                prev_closed = 0;
+            }
+            usleep(100000); // 100ms low CPU idle sleep
+        }
     }
 
     munmap(fb, screensize);
