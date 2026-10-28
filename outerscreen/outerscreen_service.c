@@ -1,12 +1,14 @@
 /*
  * Cat S22 Flip Pip-Boy Outer Display Daemon (Rock-Solid Full-Time Always-On Edition)
- * - 128x128 OLED Framebuffer (/dev/graphics/fb2)
+ * - 128x128 OLED SPI Framebuffer (/dev/graphics/fb2)
  * - FULL TIME ALWAYS-ON:
  *     - ZERO Hall sensor code (Completely removed so flip lid events NEVER affect it)
  *     - Outer OLED backlight enforced at 255 every cycle
+ *     - Kernel wake lock held at startup to prevent SPI bus power gating during DOZE
  * - Zero-Freeze Rock-Solid 1 Hz Refresh:
  *     - Fixed 32-bit ARGB8888 color palette with full 0xFF alpha (prevents white screen)
- *     - Dual-ioctl hardware sync: FBIOPUT_VSCREENINFO + FBIOPAN_DISPLAY
+ *     - Direct mmap write + FBIOPUT_VSCREENINFO sync only (NO FBIOPAN_DISPLAY)
+ *     - FBIOPAN_DISPLAY removed: causes SPI DMA timeout (panel type=13, no DMA function)
  *     - Ultra-lightweight non-blocking telephony & telemetry polling (Zero forks, Zero hangs)
  * - Pip-Boy 3000 Vault-Tec HUD:
  *     - Header: Cellular 4G signal bars, Wi-Fi wave icon, Hotspot beacon icon
@@ -32,6 +34,20 @@
 #define FB_DEV          "/dev/graphics/fb2"
 #define BACKLIGHT_NODE  "/sys/devices/platform/soc/1a00000.qcom,mdss_mdp/1a00000.qcom,mdss_mdp:qcom,mdss_fb_secondary/leds/lcd-backlight2/brightness"
 #define BACKLIGHT_ALT   "/sys/class/leds/lcd-backlight2/brightness"
+#define WAKELOCK_PATH   "/sys/power/wake_lock"
+#define WAKELOCK_NAME   "outerscreen_wakelock\n"
+
+/* Acquire a kernel wake lock to prevent SPI bus power gating during Android DOZE.
+ * Root cause: When Android enters DOZE/sleep, the SPI bus is power-gated and
+ * FBIOPAN_DISPLAY / FBIOPUT_VSCREENINFO fail with SPI Tx transaction timeout.
+ * Holding a wake lock keeps the SPI bus powered continuously. */
+static void acquire_wakelock(void) {
+    int fd = open(WAKELOCK_PATH, O_WRONLY);
+    if (fd >= 0) {
+        write(fd, WAKELOCK_NAME, sizeof(WAKELOCK_NAME) - 1);
+        close(fd);
+    }
+}
 
 // Fully opaque 32-bit ARGB8888 color palette (Full 0xFF alpha prevents white display inversion)
 #define COLOR_BLACK         0xFF000000
@@ -386,6 +402,11 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
 
+    /* Acquire kernel wake lock IMMEDIATELY to prevent SPI bus power gating.
+     * This must happen before opening fb2, as DOZE can gate the SPI bus.
+     * Re-acquire every loop iteration to survive any kernel wake lock timeouts. */
+    acquire_wakelock();
+
     int fb_fd = open(FB_DEV, O_RDWR);
     if (fb_fd < 0) return 1;
 
@@ -522,10 +543,17 @@ int main(void) {
         last_call_state = call_state;
         anim_tick++;
 
-        // Dual-ioctl hardware sync: Commit to SPI display controller
+        /* Re-acquire wake lock every cycle to keep SPI bus powered.
+         * FBIOPAN_DISPLAY is intentionally NOT called here:
+         * The SPI panel driver (panel type=13, mdss_spi_client spi6.0) has no DMA
+         * function set, causing msm_spi_process_transfer SPI Tx transaction timeouts
+         * which reset the panel and cause white/blank flicker.
+         * We use FBIOPUT_VSCREENINFO only (triggers SPI pixel push via software path). */
+        acquire_wakelock();
         vinfo.yoffset = 0;
         ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
-        ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
+        /* Ensure mmap changes are flushed to the SPI framebuffer device */
+        msync(fb, screensize, MS_SYNC);
 
         sleep(1);
     }

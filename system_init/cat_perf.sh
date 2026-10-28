@@ -60,3 +60,13 @@ setprop ro.voltage.buildtype "GSI modded for CAT S22 FLIP"
 setprop ro.voltage.maintainer "ajugeorge"
 setprop ro.voltage.version "VoltageOS-4.4-CAT-S22-ajugeorge"
 
+# 8. Prevent Android from sleeping outer screen (SPI bus power gating fix)
+# NotificationShade forces userActivityTimeout=10000ms via window attrs.
+# When Android enters DOZE, the SPI bus is power-gated and outerscreen_service
+# loses access to /dev/graphics/fb2. The outerscreen_service now holds its own
+# kernel wake lock, but we also prevent premature doze from the settings side.
+settings put system screen_off_timeout 1800000
+settings put global low_power 0
+# Acquire a kernel-level wake lock to prevent SPI bus power gating during DOZE.
+# outerscreen_service writes this at startup, but ensure it survives reboots.
+echo "outerscreen_wakelock" > /sys/power/wake_lock 2>/dev/null

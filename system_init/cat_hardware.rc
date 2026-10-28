@@ -10,14 +10,12 @@ service cat_keylight /system/bin/cat_hall_keylight
     user root
     group root input
     seclabel u:r:su:s0
-    oneshot
 
 service outerscreen /system/bin/outerscreen_service
     class main
     user root
     group root input graphics
     seclabel u:r:su:s0
-    oneshot
 
 service cat_ptt /system/bin/cat_ptt_service
     class main
