@@ -553,8 +553,7 @@ int main(void) {
         acquire_wakelock();
         vinfo.yoffset = 0;
         ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
-        /* Ensure mmap changes are flushed to the SPI framebuffer device */
-        msync(fb, screensize, MS_SYNC);
+        ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
 
         sleep(1);
     }
