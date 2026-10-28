@@ -51,15 +51,6 @@ on property:sys.boot_completed=1
     start outerscreen
     start cat_ptt
 
-on early-init
-    setenforce 0
-
-on post-fs
-    setenforce 0
-
-on boot
-    setenforce 0
-
 # --- Device Performance & Memory Optimization ---
 service cat_perf /system/bin/cat_perf.sh
     class late_start
