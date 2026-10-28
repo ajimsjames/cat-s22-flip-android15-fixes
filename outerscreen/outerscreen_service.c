@@ -544,6 +544,10 @@ int main(void) {
         last_call_state = call_state;
         anim_tick++;
 
+        // Update watchdog heartbeat timestamp
+        int hbfd = open("/dev/shm_outerscreen_heartbeat", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (hbfd >= 0) close(hbfd);
+
         /* Re-acquire wake lock every cycle to keep SPI bus powered.
          * FBIOPAN_DISPLAY is intentionally NOT called here:
          * The SPI panel driver (panel type=13, mdss_spi_client spi6.0) has no DMA

@@ -11,10 +11,23 @@ service cat_keylight /system/bin/cat_hall_keylight
     group root input
     seclabel u:r:su:s0
 
-service outerscreen /system/bin/outerscreen_service
+# Boot logger streams raw kmsg to outer OLED until boot complete
+service cat_boot_disp /system/bin/cat_boot_display
     class main
     user root
+    group root graphics
+    seclabel u:r:su:s0
+
+# Pip-Boy 3000 HUD runs after boot complete
+service outerscreen /system/bin/outerscreen_service
+    user root
     group root input graphics
+    seclabel u:r:su:s0
+
+# 10-Second Auto-Recovery Watchdog
+service cat_watchdog /system/bin/cat_watchdog
+    user root
+    group root graphics
     seclabel u:r:su:s0
 
 service cat_ptt /system/bin/cat_ptt_service
@@ -35,9 +48,10 @@ on boot
     chmod 0666 /sys/class/leds/lcd-backlight2/brightness
     chmod 0666 /dev/shm_outerscreen_cmd
     chmod 0666 /dev/shm_outerscreen
+    chmod 0666 /dev/shm_outerscreen_heartbeat
     start keypad_debounce
     start cat_keylight
-    start outerscreen
+    start cat_boot_disp
     start cat_ptt
 
 on property:sys.boot_completed=1
@@ -46,9 +60,13 @@ on property:sys.boot_completed=1
     chmod 0666 /sys/class/leds/lcd-backlight2/brightness
     chmod 0666 /dev/shm_outerscreen_cmd
     chmod 0666 /dev/shm_outerscreen
+    chmod 0666 /dev/shm_outerscreen_heartbeat
+    # Stop boot display logger and transition to Pip-Boy HUD + Watchdog
+    stop cat_boot_disp
+    start outerscreen
+    start cat_watchdog
     start keypad_debounce
     start cat_keylight
-    start outerscreen
     start cat_ptt
 
 # --- Device Performance & Memory Optimization ---
@@ -62,14 +80,3 @@ service cat_perf /system/bin/cat_perf.sh
 on property:sys.boot_completed=1
     exec u:r:su:s0 root root -- /system/bin/cat_perf.sh
     start cat_perf
-
-# --- Persistent Diagnostic Logger Service ---
-service cat_logger /system/bin/cat_debug_logger.sh
-    class late_start
-    user root
-    group root sdcard_rw media_rw
-    seclabel u:r:su:s0
-    oneshot
-
-on property:sys.boot_completed=1
-    start cat_logger
