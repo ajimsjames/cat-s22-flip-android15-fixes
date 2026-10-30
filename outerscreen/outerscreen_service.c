@@ -285,25 +285,86 @@ static int get_battery(void) {
     return cap;
 }
 
-static int get_cpu_usage(void) {
-    static unsigned long long prev_user = 0, prev_nice = 0, prev_sys = 0, prev_idle = 0;
-    FILE *fp = fopen("/proc/stat", "r");
-    if (!fp) return 25;
-
-    unsigned long long user, nice, sys, idle;
-    char cpu_label[8];
-    if (fscanf(fp, "%s %llu %llu %llu %llu", cpu_label, &user, &nice, &sys, &idle) < 5) {
+static void get_battery_estimate(int cap, int cpu_pct, char *line1, size_t len1, char *line2, size_t len2) {
+    char status[32] = "Discharging";
+    FILE *fp = fopen("/sys/class/power_supply/battery/status", "r");
+    if (fp) {
+        if (fgets(status, sizeof(status), fp)) {
+            char *nl = strpbrk(status, "\r\n");
+            if (nl) *nl = '\0';
+        }
         fclose(fp);
-        return 25;
+    }
+
+    int cur_ua = 0;
+    fp = fopen("/sys/class/power_supply/battery/current_now", "r");
+    if (fp) {
+        if (fscanf(fp, "%d", &cur_ua) != 1) cur_ua = 0;
+        fclose(fp);
+    }
+    int cur_ma = abs(cur_ua) / 1000;
+    if (cur_ma == 0 && abs(cur_ua) > 0) cur_ma = abs(cur_ua);
+
+    if (strncmp(status, "Full", 4) == 0 || (strncmp(status, "Charging", 8) == 0 && cap >= 100)) {
+        snprintf(line1, len1, "> BAT: FULL (100%%)");
+        snprintf(line2, len2, "> AC POWER CONNECTED");
+        return;
+    }
+
+    if (strncmp(status, "Charging", 8) == 0) {
+        /* 2000 mAh cell: estimate time to 100% */
+        int rem_pct = 100 - cap;
+        int rate_ma = (cur_ma >= 80 && cur_ma <= 2000) ? cur_ma : 550;
+        int mins_to_full = (rem_pct * 20 * 60) / rate_ma;
+        int h = mins_to_full / 60;
+        int m = mins_to_full % 60;
+        snprintf(line1, len1, "> CHG: +%dh %02dm FULL", h, m);
+        snprintf(line2, len2, "> LEVEL:%d%%  +%dmA", cap, rate_ma);
+        return;
+    }
+
+    /* Discharging: Cat S22 Flip 2000 mAh battery
+     * Use real current_now if valid (25..1500 mA), otherwise estimate from CPU load (~48 mA idle + 3.5 mA per CPU%) */
+    int drain_ma = (cur_ma >= 25 && cur_ma <= 1500) ? cur_ma : (48 + (cpu_pct * 3));
+    int rem_mah = (cap * 20); /* 2000 mAh * cap / 100 */
+    int total_mins = (rem_mah * 60) / drain_ma;
+    int hrs = total_mins / 60;
+    int mins = total_mins % 60;
+
+    if (hrs >= 24) {
+        int days = hrs / 24;
+        int rem_h = hrs % 24;
+        snprintf(line1, len1, "> EST: ~%dd %dh LEFT", days, rem_h);
+    } else {
+        snprintf(line1, len1, "> EST: ~%dh %02dm LEFT", hrs, mins);
+    }
+    snprintf(line2, len2, "> %d%% (%dmAh) -%dmA", cap, rem_mah, drain_ma);
+}
+
+static int get_cpu_usage(void) {
+    static unsigned long long prev_total = 0, prev_work = 0;
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) return 5;
+
+    unsigned long long user = 0, nice = 0, sys = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
+    char cpu_label[8];
+    if (fscanf(fp, "%7s %llu %llu %llu %llu %llu %llu %llu %llu",
+               cpu_label, &user, &nice, &sys, &idle, &iowait, &irq, &softirq, &steal) < 5) {
+        fclose(fp);
+        return 5;
     }
     fclose(fp);
 
-    unsigned long long total_diff = (user + nice + sys + idle) - (prev_user + prev_nice + prev_sys + prev_idle);
-    unsigned long long work_diff = (user + nice + sys) - (prev_user + prev_nice + prev_sys);
+    unsigned long long total = user + nice + sys + idle + iowait + irq + softirq + steal;
+    unsigned long long work  = user + nice + sys + irq + softirq + steal;
 
-    prev_user = user; prev_nice = nice; prev_sys = sys; prev_idle = idle;
+    unsigned long long total_diff = total - prev_total;
+    unsigned long long work_diff  = work  - prev_work;
 
-    if (total_diff == 0) return 25;
+    prev_total = total;
+    prev_work  = work;
+
+    if (total_diff == 0) return 5;
     int pct = (int)((work_diff * 100) / total_diff);
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
@@ -361,6 +422,28 @@ static int is_hotspot_active(void) {
 /* === Live logcat tail (non-blocking, 2-line rolling display) === */
 #define LOGLINE_W 21   /* chars per display line (128px / 6px per char) */
 static char live_log[2][LOGLINE_W + 1];
+static int  cfg_outer_enabled    = 1;
+static int  cfg_outer_brightness = 255;
+static char cfg_outer_footer[16] = "logcat";
+
+static void load_outer_config(void) {
+    FILE *fp = fopen("/dev/shm_outerscreen_cmd", "r");
+    if (!fp) return;
+    char line[128];
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = '\0';
+        if (strncmp(line, "outer_enabled=", 14) == 0) {
+            cfg_outer_enabled = atoi(line + 14);
+        } else if (strncmp(line, "outer_brightness=", 17) == 0) {
+            int br = atoi(line + 17);
+            if (br >= 10 && br <= 255) cfg_outer_brightness = br;
+        } else if (strncmp(line, "outer_footer=", 13) == 0) {
+            snprintf(cfg_outer_footer, sizeof(cfg_outer_footer), "%s", line + 13);
+        }
+    }
+    fclose(fp);
+}
 
 /* Poll last 2 logcat lines (brief, non-blocking via popen with head) */
 static void poll_live_log(void) {
@@ -391,25 +474,29 @@ static void poll_live_log(void) {
     pclose(fp);
 }
 
-/* Fast, non-blocking telephony state poller */
+/* Fast, non-blocking telephony state poller (zero pipe breakage) */
 static int poll_telephony(char *caller_num, size_t max_len) {
-    FILE *fp = popen("dumpsys telephony.registry | head -n 30 2>/dev/null", "r");
+    FILE *fp = popen("dumpsys telephony.registry 2>/dev/null", "r");
     if (!fp) return 0;
 
     char line[256];
     int call_state = 0; // 0 = IDLE, 1 = RINGING, 2 = OFFHOOK
+    int lines_read = 0;
     if (caller_num && max_len > 0) caller_num[0] = '\0';
 
     while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "mCallState=1") || strstr(line, "mRingingCallState=1")) {
-            call_state = 1;
-        } else if (strstr(line, "mCallState=2") || strstr(line, "mForegroundCallState=1")) {
-            call_state = 2;
-        }
+        lines_read++;
+        if (lines_read <= 40) {
+            if (strstr(line, "mCallState=1") || strstr(line, "mRingingCallState=1")) {
+                call_state = 1;
+            } else if (strstr(line, "mCallState=2") || strstr(line, "mForegroundCallState=1")) {
+                call_state = 2;
+            }
 
-        char *incoming = strstr(line, "mCallIncomingNumber=");
-        if (incoming && caller_num && max_len > 0) {
-            sscanf(incoming, "mCallIncomingNumber=%s", caller_num);
+            char *incoming = strstr(line, "mCallIncomingNumber=");
+            if (incoming && caller_num && max_len > 0) {
+                sscanf(incoming, "mCallIncomingNumber=%s", caller_num);
+            }
         }
     }
     pclose(fp);
@@ -469,7 +556,6 @@ static void draw_telemetry_gauge(uint32_t *fb, int y, const char *label, int pct
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_IGN);
 
     log_open();
     outerlog("outerscreen_service starting up (Cat S22 FLIP Pip-Boy HUD)");
@@ -500,6 +586,8 @@ int main(void) {
     }
 
     int last_call_state = 0;
+    int call_state = 0;
+    char incoming_num[64] = {0};
     time_t call_start_time = 0;
     int anim_tick = 0;
     unsigned long loop_count = 0;
@@ -514,22 +602,37 @@ int main(void) {
     for (;;) {
         loop_count++;
 
-        // Enforce backlight 255 every second so display never sleeps or dims
+        load_outer_config();
+
+        if (!cfg_outer_enabled) {
+            set_backlight(0);
+            clear_screen(fb);
+            vinfo.yoffset = 0;
+            ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
+            int hbfd = open("/dev/shm_outerscreen_heartbeat", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+            if (hbfd >= 0) close(hbfd);
+            sleep(1);
+            continue;
+        }
+
+        // Enforce configured backlight every second so display never sleeps or dims
         set_backlight(255);
         ioctl(fb_fd, FBIOBLANK, FB_BLANK_UNBLANK);
 
         clear_screen(fb);
 
-        char incoming_num[64] = {0};
-        int call_state = poll_telephony(incoming_num, sizeof(incoming_num));
+        /* Poll telephony every 2s when idle, or every 1s when ringing/in-call */
+        if (call_state != 0 || loop_count % 2 == 1) {
+            call_state = poll_telephony(incoming_num, sizeof(incoming_num));
+        }
 
         /* Log call state transitions */
         if (call_state != last_call_state) {
             outerlog("call state: %d -> %d (num=%s)", last_call_state, call_state, incoming_num[0] ? incoming_num : "none");
         }
 
-        /* Update live logcat tail every 5 seconds (logcat is relatively slow) */
-        if (loop_count % 5 == 0) {
+        /* Update live logcat tail every 10 seconds (only when idle & logcat mode) */
+        if (call_state == 0 && strcmp(cfg_outer_footer, "logcat") == 0 && (loop_count == 1 || loop_count % 10 == 0)) {
             poll_live_log();
         }
 
@@ -631,18 +734,28 @@ int main(void) {
             draw_telemetry_gauge(fb, 76, "CPU", cpu);
             draw_telemetry_gauge(fb, 90, "RAM", ram);
 
-            // 4. FOOTER: Live logcat tail (2 rolling lines)
+            // 4. FOOTER: Estimated Battery Life, Live logcat tail, or Pip-Boy Status
             draw_hline(fb, 2, 102, 124, COLOR_PIP_DARK);
-            /* Line 1: y=105, Line 2: y=114 — 1px font, 9px row pitch */
-            if (live_log[0][0]) {
-                draw_string(fb, 2, 105, live_log[0], COLOR_PIP_GREEN, 1);
-            } else {
-                draw_string(fb, 2, 105, "> SYS:IDLE", COLOR_PIP_DARK, 1);
-            }
-            if (live_log[1][0]) {
-                draw_string(fb, 2, 114, live_log[1], COLOR_PIP_GREEN, 1);
-            } else {
-                draw_string(fb, 2, 114, "> ...", COLOR_PIP_DARK, 1);
+            if (strcmp(cfg_outer_footer, "battery") == 0) {
+                char bat_l1[32] = {0}, bat_l2[32] = {0};
+                get_battery_estimate(bat >= 0 ? bat : 0, cpu, bat_l1, sizeof(bat_l1), bat_l2, sizeof(bat_l2));
+                draw_string(fb, 2, 105, bat_l1, COLOR_PIP_GREEN, 1);
+                draw_string(fb, 2, 114, bat_l2, COLOR_PIP_LIGHT, 1);
+            } else if (strcmp(cfg_outer_footer, "status") == 0) {
+                draw_string(fb, 4, 105, "> SYS:ONLINE  LTE:OK", COLOR_PIP_GREEN, 1);
+                draw_string(fb, 4, 114, "> VAULT-TEC CAT-S22", COLOR_PIP_LIGHT, 1);
+            } else if (strcmp(cfg_outer_footer, "logcat") == 0) {
+                /* Line 1: y=105, Line 2: y=114 — 1px font, 9px row pitch */
+                if (live_log[0][0]) {
+                    draw_string(fb, 2, 105, live_log[0], COLOR_PIP_GREEN, 1);
+                } else {
+                    draw_string(fb, 2, 105, "> SYS:IDLE", COLOR_PIP_DARK, 1);
+                }
+                if (live_log[1][0]) {
+                    draw_string(fb, 2, 114, live_log[1], COLOR_PIP_GREEN, 1);
+                } else {
+                    draw_string(fb, 2, 114, "> ...", COLOR_PIP_DARK, 1);
+                }
             }
         }
 

@@ -205,7 +205,7 @@ static void render_terminal(uint32_t *fb) {
     // Header
     for (int i = 0; i < 128 * 128; i++) fb[i] = COLOR_BLACK;
 
-    draw_string(fb, 2, 2, ">>> VOLTAGE-OS BOOT", COLOR_GREEN);
+    draw_string(fb, 2, 2, "CAT S22 Flip Booting", COLOR_GREEN);
     for (int x = 0; x < 128; x++) fb[10 * 128 + x] = COLOR_DIM_GREEN;
 
     int y = 14;

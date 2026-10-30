@@ -70,3 +70,30 @@ settings put global low_power 0
 # Acquire a kernel-level wake lock to prevent SPI bus power gating during DOZE.
 # outerscreen_service writes this at startup, but ensure it survives reboots.
 echo "outerscreen_wakelock" > /sys/power/wake_lock 2>/dev/null
+
+# 9. Infinity-X Low-RAM (2GB) & Kernel 4.9 LMKD + Axion Performance Tuning
+setprop persist.sys.phh.lmk_tweaks true
+setprop persist.sys.phh.axion_props true
+
+# 10. UI Smoothness: 0.5x Snappy Animations, Disable Blur & Enable Scroll Boost
+settings put global window_animation_scale 0.5
+settings put global transition_animation_scale 0.5
+settings put global animator_duration_scale 0.5
+settings put global disable_window_blurs 1
+setprop persist.sys.phh.scroll_boost true
+setprop persist.sys.phh.sf_disable_backpressure 1
+setprop persist.sys.phh.sf_auto_latch_unsignaled true
+
+# 11. Trim Unneeded Google Background Services (Nearby Share, Wearable, Offline BLE Beacon, PartnerSetup, Telemetry)
+pm disable-user --user 0 com.google.android.partnersetup 2>/dev/null
+for svc in \
+    "com.google.android.gms/.nearby.discovery.service.DiscoveryService" \
+    "com.google.android.gms/.nearby.presence.service.LifeCycleService" \
+    "com.google.android.gms/.nearby.sharing.ReceiveSurfaceService" \
+    "com.google.android.gms/.nearby.sharing.SendSurfaceService" \
+    "com.google.android.gms/.wearable.service.WearableService" \
+    "com.google.android.gms/.findmydevice.spot.bleadvertising.OfflineBeaconService_Persistent" \
+    "com.google.android.gms/.clearcut.debug.ClearcutDebugDumpService" \
+    "com.google.android.gms/.tron.CollectionService"; do
+    pm disable "$svc" 2>/dev/null
+done

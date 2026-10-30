@@ -1,12 +1,10 @@
 /*
  * Cat S22 Flip Keypad Light & Hall Sensor Controller Daemon
- * - Dedicated standalone init daemon running under root.
- * - Monitors /dev/input/event3 (hall_sensor):
- *     - Value = 0 (hall near / flip closed):
- *         - Turns OFF keypad backlight
- *     - Value = 1 (hall far / flip opened):
- *         - Turns ON keypad backlight
- * - Includes /data/local/tmp/cat_keylight.log for live debugging!
+ * - Monitors /dev/input/event3 (hall_sensor) + /dev/input/event* (keypad activity)
+ * - Reads user settings from /dev/shm_outerscreen_cmd (written by CatParts Settings app):
+ *     keylight_enabled=<1|0>
+ *     keylight_brightness=<0..255>
+ *     keylight_timeout=<0|5|10|30|60>  (0 = stay on while flip open)
  */
 
 #include <stdio.h>
@@ -16,96 +14,118 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
+#include <time.h>
+#include <poll.h>
+#include <sys/stat.h>
 #include <linux/input.h>
 
-#define LOG_FILE        "/data/local/tmp/cat_keylight.log"
 #define HALL_DEV        "/dev/input/event3"
 #define KEYLIGHT_SYSFS  "/sys/devices/platform/soc/soc:keyboard_light/leds/keyboard_light/brightness"
 #define KEYLIGHT_ALT    "/sys/class/leds/keyboard_light/brightness"
+#define CONFIG_FILE     "/dev/shm_outerscreen_cmd"
 
-static void log_msg(const char *msg) {
-    FILE *fp = fopen(LOG_FILE, "a");
-    if (fp) {
-        fprintf(fp, "%s\n", msg);
-        fclose(fp);
-    }
-}
+static int cfg_kl_enabled    = 1;
+static int cfg_kl_brightness = 255;
+static int cfg_kl_timeout    = 0; /* 0 = stay on while flip open */
+static int lid_open          = 1;
+static int current_led_val   = -1;
 
 static void set_keypad_light(int val) {
-    char logbuf[128];
+    if (val == current_led_val) return;
     int fd = open(KEYLIGHT_SYSFS, O_WRONLY);
-    if (fd < 0) {
-        snprintf(logbuf, sizeof(logbuf), "Failed to open primary sysfs: errno=%d (%s)", errno, strerror(errno));
-        log_msg(logbuf);
-        fd = open(KEYLIGHT_ALT, O_WRONLY);
-    }
+    if (fd < 0) fd = open(KEYLIGHT_ALT, O_WRONLY);
     if (fd >= 0) {
         char buf[16];
         int len = snprintf(buf, sizeof(buf), "%d\n", val);
-        int wr = write(fd, buf, len);
+        write(fd, buf, len);
         close(fd);
-        snprintf(logbuf, sizeof(logbuf), "Wrote %d to keyboard_light (ret=%d)", val, wr);
-        log_msg(logbuf);
-    } else {
-        snprintf(logbuf, sizeof(logbuf), "Failed to open alt sysfs: errno=%d (%s)", errno, strerror(errno));
-        log_msg(logbuf);
+        current_led_val = val;
     }
 }
 
-int main(void) {
-    signal(SIGCHLD, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
-
-    log_msg("--- cat_hall_keylight starting ---");
-
-    int fd = -1;
-    while (fd < 0) {
-        fd = open(HALL_DEV, O_RDONLY);
-        if (fd < 0) {
-            char logbuf[128];
-            snprintf(logbuf, sizeof(logbuf), "Failed to open HALL_DEV (%s): errno=%d (%s)", HALL_DEV, errno, strerror(errno));
-            log_msg(logbuf);
-            sleep(1);
+static void load_config(void) {
+    FILE *fp = fopen(CONFIG_FILE, "r");
+    if (!fp) return;
+    char line[128];
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = '\0';
+        if (strncmp(line, "keylight_enabled=", 17) == 0) {
+            cfg_kl_enabled = atoi(line + 17);
+        } else if (strncmp(line, "keylight_brightness=", 20) == 0) {
+            cfg_kl_brightness = atoi(line + 20);
+            if (cfg_kl_brightness < 0) cfg_kl_brightness = 0;
+            if (cfg_kl_brightness > 255) cfg_kl_brightness = 255;
+        } else if (strncmp(line, "keylight_timeout=", 17) == 0) {
+            cfg_kl_timeout = atoi(line + 17);
         }
     }
-    log_msg("Opened HALL_DEV successfully");
+    fclose(fp);
+}
 
-    /* Initial state set */
-    set_keypad_light(255);
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
 
-    struct input_event ev;
-    int last_val = -1;
+    load_config();
+
+    struct pollfd fds[16];
+    int num_fds = 0;
+    for (int i = 0; i < 16; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd >= 0) {
+            fds[num_fds].fd = fd;
+            fds[num_fds].events = POLLIN;
+            num_fds++;
+        }
+    }
+
+    time_t last_activity = time(NULL);
+    time_t last_cfg_mtime = 0;
+
+    set_keypad_light(cfg_kl_enabled ? cfg_kl_brightness : 0);
 
     for (;;) {
-        ssize_t n = read(fd, &ev, sizeof(ev));
-        if (n < (ssize_t)sizeof(ev)) {
-            char logbuf[128];
-            snprintf(logbuf, sizeof(logbuf), "Short read n=%zd (errno=%d: %s)", n, errno, strerror(errno));
-            log_msg(logbuf);
-            close(fd);
-            sleep(1);
-            fd = open(HALL_DEV, O_RDONLY);
-            continue;
+        int ret = poll(fds, num_fds, 1000);
+        time_t now = time(NULL);
+
+        struct stat st;
+        if (stat(CONFIG_FILE, &st) == 0 && st.st_mtime != last_cfg_mtime) {
+            last_cfg_mtime = st.st_mtime;
+            load_config();
+            last_activity = now;
+            current_led_val = -1; /* force refresh */
         }
 
-        /* EV_SW = 0x05, SW_LID = 0x00 */
-        if (ev.type == 0x05 && ev.code == 0x00) {
-            char logbuf[128];
-            snprintf(logbuf, sizeof(logbuf), "Got SW_LID event value=%d", ev.value);
-            log_msg(logbuf);
-            if (ev.value != last_val) {
-                last_val = ev.value;
-                if (ev.value == 0) {
-                    /* Flip Closed -> Keypad light OFF immediately */
-                    set_keypad_light(0);
-                } else if (ev.value == 1) {
-                    /* Flip Opened -> Keypad light ON immediately */
-                    set_keypad_light(255);
+        if (ret > 0) {
+            for (int i = 0; i < num_fds; i++) {
+                if (fds[i].revents & POLLIN) {
+                    struct input_event ev;
+                    while (read(fds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                        /* EV_SW = 0x05, SW_LID = 0x00 */
+                        if (ev.type == 0x05 && ev.code == 0x00) {
+                            lid_open = (ev.value != 0) ? 1 : 0;
+                            last_activity = now;
+                            current_led_val = -1;
+                        } else if (ev.type == EV_KEY && ev.value == 1) {
+                            /* Physical key press wakes keypad backlight if lid is open */
+                            last_activity = now;
+                        }
+                    }
                 }
             }
         }
+
+        if (!lid_open || !cfg_kl_enabled || cfg_kl_brightness == 0) {
+            set_keypad_light(0);
+        } else if (cfg_kl_timeout > 0 && (now - last_activity) >= cfg_kl_timeout) {
+            set_keypad_light(0);
+        } else {
+            set_keypad_light(cfg_kl_brightness);
+        }
     }
 
-    close(fd);
+    for (int i = 0; i < num_fds; i++) close(fds[i].fd);
     return 0;
 }
