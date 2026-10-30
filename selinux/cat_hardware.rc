@@ -1,19 +1,81 @@
-service rezygisk_daemon /system/bin/start_rezygisk_daemon.sh
+service keypad_debounce /system/bin/keypad_debounce_clean
+    class main
+    user root
+    group root input
+    seclabel u:r:su:s0
+    oneshot
+
+service cat_keylight /system/bin/cat_hall_keylight
+    class main
+    user root
+    group root input
+    seclabel u:r:su:s0
+
+# Boot logger streams raw kmsg to outer OLED until boot complete
+service cat_boot_disp /system/bin/cat_boot_display
+    class main
+    user root
+    group root graphics
+    seclabel u:r:su:s0
+
+# Pip-Boy 3000 HUD runs after boot complete
+service outerscreen /system/bin/outerscreen_service
+    user root
+    group root input graphics
+    seclabel u:r:su:s0
+
+# 10-Second Auto-Recovery Watchdog
+service cat_watchdog /system/bin/cat_watchdog
+    user root
+    group root graphics
+    seclabel u:r:su:s0
+
+service cat_ptt /system/bin/cat_ptt_service
+    class main
+    user root
+    group root input
+    seclabel u:r:su:s0
+
+on early-init
+    chmod 0666 /sys/class/leds/keyboard_light/brightness
+    chmod 0666 /sys/devices/platform/soc/soc:keyboard_light/leds/keyboard_light/brightness
+    chmod 0666 /sys/class/leds/lcd-backlight2/brightness
+
+on boot
+    chmod 0666 /sys/class/leds/keyboard_light/brightness
+    chmod 0666 /sys/devices/platform/soc/soc:keyboard_light/leds/keyboard_light/brightness
+    chmod 0666 /sys/class/leds/lcd-backlight2/brightness
+    chmod 0666 /dev/shm_outerscreen_cmd
+    chmod 0666 /dev/shm_outerscreen
+    chmod 0666 /dev/shm_outerscreen_heartbeat
+    start keypad_debounce
+    start cat_keylight
+    start cat_boot_disp
+    start cat_ptt
+
+on property:sys.boot_completed=1
+    chmod 0666 /sys/class/leds/keyboard_light/brightness
+    chmod 0666 /sys/devices/platform/soc/soc:keyboard_light/leds/keyboard_light/brightness
+    chmod 0666 /sys/class/leds/lcd-backlight2/brightness
+    chmod 0666 /dev/shm_outerscreen_cmd
+    chmod 0666 /dev/shm_outerscreen
+    chmod 0666 /dev/shm_outerscreen_heartbeat
+    # Stop boot display logger and transition to Pip-Boy HUD + Watchdog
+    stop cat_boot_disp
+    start outerscreen
+    start cat_watchdog
+    start keypad_debounce
+    start cat_keylight
+    start cat_ptt
+
+# --- Device Performance & Memory Optimization ---
+service cat_perf /system/bin/cat_perf.sh
     class late_start
     user root
     group root
     seclabel u:r:su:s0
     oneshot
 
-on boot
-    chmod 0666 /sys/class/leds/keyboard_light/brightness
-    chmod 0666 /sys/class/leds/lcd-backlight2/brightness
-    chmod 0666 /dev/shm_outerscreen_cmd
-    chmod 0666 /dev/shm_outerscreen
-
 on property:sys.boot_completed=1
-    chmod 0666 /sys/class/leds/keyboard_light/brightness
-    chmod 0666 /sys/class/leds/lcd-backlight2/brightness
-    chmod 0666 /dev/shm_outerscreen_cmd
-    chmod 0666 /dev/shm_outerscreen
-    start rezygisk_daemon
+    exec u:r:su:s0 root root -- /system/bin/cat_perf.sh
+    start cat_perf

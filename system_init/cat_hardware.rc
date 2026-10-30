@@ -35,7 +35,6 @@ service cat_ptt /system/bin/cat_ptt_service
     user root
     group root input
     seclabel u:r:su:s0
-    oneshot
 
 on early-init
     chmod 0666 /sys/class/leds/keyboard_light/brightness

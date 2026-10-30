@@ -2,6 +2,9 @@
  * Cat S22 Flip Outer Display Boot Logger
  * Streams raw kernel (/dev/kmsg) and early logcat to outer 128x128 OLED (/dev/graphics/fb2)
  * Runs from early boot until sys.boot_completed=1
+ * - Scale-1 font (5x7px): fits 21 chars wide, 14 rows tall (starting at y=14 after header)
+ * - Circular scrolling buffer: always shows the LATEST lines, scrolls up as new lines arrive
+ * - Strips syslog/kmsg priority prefixes before display
  */
 
 #include <stdio.h>
@@ -159,8 +162,8 @@ static void draw_string(uint32_t *fb, int x, int y, const char *str, uint32_t co
     }
 }
 
-#define MAX_LINES 15
-#define LINE_CHARS 21
+#define MAX_LINES 14   /* 128px - 14px header = 114px / 8px row = 14 rows */
+#define LINE_CHARS 21  /* 128px / 6px per char = 21 chars per line */
 
 static char term_lines[MAX_LINES][LINE_CHARS + 1];
 static int num_lines = 0;
@@ -241,6 +244,8 @@ int main(void) {
     set_backlight(255);
 
     int kmsg_fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+    /* Seek to end of ring buffer so we see only new messages from here on */
+    if (kmsg_fd >= 0) lseek(kmsg_fd, 0, SEEK_END);
 
     add_line("Kernel display init");
     add_line("OLED 128x128 online");

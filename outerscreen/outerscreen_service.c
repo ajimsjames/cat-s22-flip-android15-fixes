@@ -10,13 +10,15 @@
  *     - Direct mmap write + FBIOPUT_VSCREENINFO sync only (NO FBIOPAN_DISPLAY)
  *     - FBIOPAN_DISPLAY removed: causes SPI DMA timeout (panel type=13, no DMA function)
  *     - Ultra-lightweight non-blocking telephony & telemetry polling (Zero forks, Zero hangs)
- * - Pip-Boy 3000 Vault-Tec HUD:
- *     - Header: Cellular 4G signal bars, Wi-Fi wave icon, Hotspot beacon icon
+ * - Pip-Boy 3000 Vault-Tec HUD (Cat S22 FLIP Edition):
+ *     - Header: Cellular 4G signal bars, Wi-Fi wave icon, Hotspot beacon icon, "Cat S22 FLIP"
  *     - Center: Bold retro digital clock (HH:MM) with ticking seconds (:SS) and full date
  *     - Gauges: Live kernel BAT%, CPU%, RAM% telemetry bars
+ *     - Footer: Rolling live logcat tail (last 2 lines)
  *     - In-Call HUDs:
  *         - Incoming: Amber alert header, caller ID, signal gauge, PTT answer prompt
  *         - Active: Comms link timer MM:SS, speaker routing, animated audio equalizer wave
+ * - Logging: Writes operational log to /sdcard/CatLogs/outerscreen.log
  * - Pure C, zero external dependencies, zero root/Magisk required.
  */
 
@@ -28,8 +30,42 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/fb.h>
 #include <signal.h>
+#include <stdarg.h>
+
+/* === Logging === */
+#define LOG_PATH  "/sdcard/CatLogs/outerscreen.log"
+#define LOG_MAX   (256 * 1024)  /* rotate at 256 KB */
+
+static FILE *g_log_fp = NULL;
+
+static void log_open(void) {
+    /* Create log directory if needed */
+    mkdir("/sdcard/CatLogs", 0755);
+    /* Rotate if too large */
+    struct stat st;
+    if (stat(LOG_PATH, &st) == 0 && st.st_size > LOG_MAX) {
+        rename(LOG_PATH, LOG_PATH ".bak");
+    }
+    g_log_fp = fopen(LOG_PATH, "a");
+}
+
+static void outerlog(const char *fmt, ...) {
+    if (!g_log_fp) return;
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", t);
+    fprintf(g_log_fp, "[%s] ", ts);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_log_fp, fmt, ap);
+    va_end(ap);
+    fprintf(g_log_fp, "\n");
+    fflush(g_log_fp);
+}
 
 #define FB_DEV          "/dev/graphics/fb2"
 #define BACKLIGHT_NODE  "/sys/devices/platform/soc/1a00000.qcom,mdss_mdp/1a00000.qcom,mdss_mdp:qcom,mdss_fb_secondary/leds/lcd-backlight2/brightness"
@@ -322,6 +358,39 @@ static int is_hotspot_active(void) {
     return count > 0;
 }
 
+/* === Live logcat tail (non-blocking, 2-line rolling display) === */
+#define LOGLINE_W 21   /* chars per display line (128px / 6px per char) */
+static char live_log[2][LOGLINE_W + 1];
+
+/* Poll last 2 logcat lines (brief, non-blocking via popen with head) */
+static void poll_live_log(void) {
+    /* logcat -d: dump current buffer, no follow; -T 4 lines, pick last 2 */
+    FILE *fp = popen("logcat -d -v brief -T 4 '*:W' 2>/dev/null | tail -n 2", "r");
+    if (!fp) return;
+
+    char buf[256];
+    int idx = 0;
+    while (fgets(buf, sizeof(buf), fp) && idx < 2) {
+        /* Strip priority/tag prefix: keep only the message part after ": " */
+        const char *msg = strstr(buf, "): ");
+        if (msg) msg += 3; else msg = buf;
+        /* Trim newline */
+        int len = 0;
+        while (msg[len] && msg[len] != '\n' && msg[len] != '\r') len++;
+        /* Copy up to LOGLINE_W printable chars */
+        int out = 0;
+        for (int i = 0; i < len && out < LOGLINE_W; i++) {
+            if ((unsigned char)msg[i] >= 32 && (unsigned char)msg[i] <= 126)
+                live_log[idx][out++] = msg[i];
+        }
+        live_log[idx][out] = '\0';
+        idx++;
+    }
+    /* Pad any unpopulated lines */
+    for (; idx < 2; idx++) live_log[idx][0] = '\0';
+    pclose(fp);
+}
+
 /* Fast, non-blocking telephony state poller */
 static int poll_telephony(char *caller_num, size_t max_len) {
     FILE *fp = popen("dumpsys telephony.registry | head -n 30 2>/dev/null", "r");
@@ -402,16 +471,22 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
 
+    log_open();
+    outerlog("outerscreen_service starting up (Cat S22 FLIP Pip-Boy HUD)");
+
     /* Acquire kernel wake lock IMMEDIATELY to prevent SPI bus power gating.
      * This must happen before opening fb2, as DOZE can gate the SPI bus.
      * Re-acquire every loop iteration to survive any kernel wake lock timeouts. */
     acquire_wakelock();
+    outerlog("wake lock acquired, opening fb2");
 
     int fb_fd = open(FB_DEV, O_RDWR);
-    if (fb_fd < 0) return 1;
+    if (fb_fd < 0) { outerlog("ERROR: cannot open fb2"); return 1; }
+    outerlog("fb2 opened OK");
 
     struct fb_var_screeninfo vinfo;
     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo)) {
+        outerlog("ERROR: FBIOGET_VSCREENINFO failed");
         close(fb_fd);
         return 1;
     }
@@ -419,6 +494,7 @@ int main(void) {
     size_t screensize = 128 * 128 * 4;
     uint32_t *fb = (uint32_t *)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
     if (fb == MAP_FAILED) {
+        outerlog("ERROR: mmap failed");
         close(fb_fd);
         return 1;
     }
@@ -426,9 +502,18 @@ int main(void) {
     int last_call_state = 0;
     time_t call_start_time = 0;
     int anim_tick = 0;
+    unsigned long loop_count = 0;
+
+    /* Prime the live log buffer */
+    live_log[0][0] = '\0';
+    live_log[1][0] = '\0';
+
+    outerlog("entering main display loop");
 
     /* FULL TIME ALWAYS-ON REFRESH LOOP */
     for (;;) {
+        loop_count++;
+
         // Enforce backlight 255 every second so display never sleeps or dims
         set_backlight(255);
         ioctl(fb_fd, FBIOBLANK, FB_BLANK_UNBLANK);
@@ -437,6 +522,16 @@ int main(void) {
 
         char incoming_num[64] = {0};
         int call_state = poll_telephony(incoming_num, sizeof(incoming_num));
+
+        /* Log call state transitions */
+        if (call_state != last_call_state) {
+            outerlog("call state: %d -> %d (num=%s)", last_call_state, call_state, incoming_num[0] ? incoming_num : "none");
+        }
+
+        /* Update live logcat tail every 5 seconds (logcat is relatively slow) */
+        if (loop_count % 5 == 0) {
+            poll_live_log();
+        }
 
         if (call_state == 1) {
             /* === PIP-BOY INCOMING TRANSMISSION HUD === */
@@ -492,7 +587,7 @@ int main(void) {
             draw_string_centered(fb, 105, "HOLD [PTT]: END CALL", COLOR_RED, 1);
 
         } else {
-            /* === PIP-BOY 3000 TACTICAL HUD WATCHFACE (ALWAYS-ON FULL TIME) === */
+            /* === Cat S22 FLIP PIP-BOY HUD WATCHFACE (ALWAYS-ON FULL TIME) === */
             call_start_time = 0;
 
             time_t now = time(NULL);
@@ -506,7 +601,8 @@ int main(void) {
             draw_wifi_icon(fb, 20, 3, COLOR_PIP_GREEN, wifi_on);
             draw_hotspot_icon(fb, 36, 3, COLOR_AMBER, hotspot_on);
 
-            draw_string(fb, 56, 3, "PIP-BOY 3000", COLOR_PIP_LIGHT, 1);
+            /* Title: "Cat S22 FLIP" */
+            draw_string(fb, 50, 3, "Cat S22 FLIP", COLOR_PIP_LIGHT, 1);
             draw_hline(fb, 2, 14, 124, COLOR_PIP_DARK);
 
             // 2. CENTER HIGH-CONTRAST DIGITAL CLOCK
@@ -535,14 +631,28 @@ int main(void) {
             draw_telemetry_gauge(fb, 76, "CPU", cpu);
             draw_telemetry_gauge(fb, 90, "RAM", ram);
 
-            // 4. FOOTER STATUS
-            draw_hline(fb, 2, 104, 124, COLOR_PIP_DARK);
-            draw_string(fb, 6, 110, "> SYS:OK", COLOR_PIP_GREEN, 1);
-            draw_string(fb, 72, 110, "CAT-S22", COLOR_PIP_DARK, 1);
+            // 4. FOOTER: Live logcat tail (2 rolling lines)
+            draw_hline(fb, 2, 102, 124, COLOR_PIP_DARK);
+            /* Line 1: y=105, Line 2: y=114 — 1px font, 9px row pitch */
+            if (live_log[0][0]) {
+                draw_string(fb, 2, 105, live_log[0], COLOR_PIP_GREEN, 1);
+            } else {
+                draw_string(fb, 2, 105, "> SYS:IDLE", COLOR_PIP_DARK, 1);
+            }
+            if (live_log[1][0]) {
+                draw_string(fb, 2, 114, live_log[1], COLOR_PIP_GREEN, 1);
+            } else {
+                draw_string(fb, 2, 114, "> ...", COLOR_PIP_DARK, 1);
+            }
         }
 
         last_call_state = call_state;
         anim_tick++;
+
+        /* Periodic log: every 60s log a status heartbeat */
+        if (loop_count % 60 == 0) {
+            outerlog("alive: loop=%lu call=%d", loop_count, call_state);
+        }
 
         // Update watchdog heartbeat timestamp
         int hbfd = open("/dev/shm_outerscreen_heartbeat", O_CREAT | O_WRONLY | O_TRUNC, 0666);
@@ -564,5 +674,6 @@ int main(void) {
 
     munmap(fb, screensize);
     close(fb_fd);
+    if (g_log_fp) fclose(g_log_fp);
     return 0;
 }

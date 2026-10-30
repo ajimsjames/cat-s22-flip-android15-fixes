@@ -2,10 +2,16 @@
  * Cat S22 Flip PTT Hardware Service (Multi-Device Auto-Discovery)
  * - Auto-detects and opens both /dev/input/event1 and uinput virtual devices
  * - Does NOT use EVIOCGRAB so it co-exists with keypad debounce
- * - Detects long-press (>500ms):
- *     - If incoming call (RINGING): Answers call via Speakerphone
- *     - If active call (OFFHOOK): Hangs up / ends call
- * - If idle: Short press toggles torch / flashlight
+ * - Detects press duration:
+ *     SHORT PRESS (<500ms):
+ *         - If idle: Toggles torch / flashlight
+ *     LONG PRESS (500ms – 1999ms):
+ *         - If incoming call (RINGING): Answers call via Speakerphone
+ *         - If active call (OFFHOOK): Hangs up / ends call
+ *     LONG-LONG PRESS (>=2000ms, idle only):
+ *         - 1st press: Kill all outerscreen processes (outerscreen_service + cat_watchdog)
+ *           Outer display shows black/off - useful to clear frozen/zombie processes
+ *         - 2nd press: Restart outerscreen_service + cat_watchdog via init
  * Zero root / Zero Magisk required - runs as native init service.
  */
 
@@ -20,8 +26,12 @@
 #include <dirent.h>
 #include <linux/input.h>
 
-#define PTT_KEY_CODE    248 /* KEY_MICMUTE / PTT */
-#define LONG_PRESS_MS   500
+#define PTT_KEY_CODE       248  /* KEY_MICMUTE / PTT */
+#define SHORT_PRESS_MS     500
+#define LONG_LONG_PRESS_MS 2000
+
+/* Toggle: 0 = outerscreen is running, 1 = outerscreen killed (next press restarts) */
+static int outerscreen_killed = 0;
 
 static int get_call_state(char *number_out, size_t max_len) {
     /* Returns: 0 = IDLE, 1 = RINGING, 2 = OFFHOOK */
@@ -63,6 +73,24 @@ static void trigger_hangup(void) {
 
 static void trigger_torch_toggle(void) {
     system("cmd statusbar toggle-flashlight 2>/dev/null");
+}
+
+/* Kill all outerscreen services and the watchdog to prevent auto-restart */
+static void outerscreen_kill_all(void) {
+    /* Kill watchdog first so it doesn't restart outerscreen immediately */
+    system("kill -9 $(pidof cat_watchdog) 2>/dev/null; killall -9 cat_watchdog 2>/dev/null");
+    usleep(100000);
+    system("kill -9 $(pidof outerscreen_service) 2>/dev/null; killall -9 outerscreen_service 2>/dev/null");
+    outerscreen_killed = 1;
+}
+
+/* Restart outerscreen_service and cat_watchdog via init */
+static void outerscreen_restart(void) {
+    /* Re-start via Android init (registered in cat_hardware.rc) */
+    system("start outerscreen 2>/dev/null");
+    usleep(500000);
+    system("start cat_watchdog 2>/dev/null");
+    outerscreen_killed = 0;
 }
 
 int main(void) {
@@ -111,15 +139,24 @@ int main(void) {
                             char incoming_num[64] = {0};
                             int call_state = get_call_state(incoming_num, sizeof(incoming_num));
 
-                            if (elapsed_ms >= LONG_PRESS_MS) {
-                                /* LONG PRESS (>500ms) */
+                            if (elapsed_ms >= LONG_LONG_PRESS_MS) {
+                                /* LONG-LONG PRESS (>=2s): outerscreen kill / restart toggle */
+                                if (call_state == 0) {
+                                    if (!outerscreen_killed) {
+                                        outerscreen_kill_all();
+                                    } else {
+                                        outerscreen_restart();
+                                    }
+                                }
+                            } else if (elapsed_ms >= SHORT_PRESS_MS) {
+                                /* LONG PRESS (500ms–1999ms): call actions */
                                 if (call_state == 1) {
                                     trigger_speaker_answer();
                                 } else if (call_state == 2) {
                                     trigger_hangup();
                                 }
                             } else {
-                                /* SHORT PRESS */
+                                /* SHORT PRESS (<500ms): torch toggle when idle */
                                 if (call_state == 0) {
                                     trigger_torch_toggle();
                                 }
