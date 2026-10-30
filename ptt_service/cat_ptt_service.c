@@ -26,7 +26,7 @@
 #include <dirent.h>
 #include <linux/input.h>
 
-#define PTT_KEY_CODE       248  /* KEY_MICMUTE / PTT */
+#define PTT_KEY_CODE       523  /* KEY_NUMERIC_B — actual PTT button keycode on Cat S22 Flip event7 */
 #define SHORT_PRESS_MS     500
 #define LONG_LONG_PRESS_MS 2000
 
