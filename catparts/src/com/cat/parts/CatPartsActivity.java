@@ -33,6 +33,8 @@ public class CatPartsActivity extends Activity {
             String pttLong = sp.getString("ptt_long", "outer_toggle");
             String pttIncall = sp.getString("ptt_incall", "answer_spk");
             boolean outerEnabled = sp.getBoolean("outer_enabled", true);
+            String outerTheme = sp.getString("outer_theme", "pipboy");
+            String outerCallTheme = sp.getString("outer_call_theme", "pipboy");
             String outerFooter = sp.getString("outer_footer", "battery");
             boolean keylightEnabled = sp.getBoolean("keylight_enabled", true);
             String keylightTimeout = sp.getString("keylight_timeout", "0");
@@ -53,6 +55,8 @@ public class CatPartsActivity extends Activity {
             sb.append("ptt_incall=").append(pttIncall).append("\n");
             sb.append("outer_enabled=").append(outerEnabled ? "1" : "0").append("\n");
             sb.append("outer_brightness=").append(effectiveOuter).append("\n");
+            sb.append("outer_theme=").append(outerTheme).append("\n");
+            sb.append("outer_call_theme=").append(outerCallTheme).append("\n");
             sb.append("outer_footer=").append(outerFooter).append("\n");
             sb.append("keylight_enabled=").append(keylightEnabled ? "1" : "0").append("\n");
             sb.append("keylight_brightness=").append(effectiveKeylight).append("\n");

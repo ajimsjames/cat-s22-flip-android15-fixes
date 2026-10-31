@@ -1,25 +1,10 @@
 /*
- * Cat S22 Flip Pip-Boy Outer Display Daemon (Rock-Solid Full-Time Always-On Edition)
- * - 128x128 OLED SPI Framebuffer (/dev/graphics/fb2)
- * - FULL TIME ALWAYS-ON:
- *     - ZERO Hall sensor code (Completely removed so flip lid events NEVER affect it)
- *     - Outer OLED backlight enforced at 255 every cycle
- *     - Kernel wake lock held at startup to prevent SPI bus power gating during DOZE
- * - Zero-Freeze Rock-Solid 1 Hz Refresh:
- *     - Fixed 32-bit ARGB8888 color palette with full 0xFF alpha (prevents white screen)
- *     - Direct mmap write + FBIOPUT_VSCREENINFO sync only (NO FBIOPAN_DISPLAY)
- *     - FBIOPAN_DISPLAY removed: causes SPI DMA timeout (panel type=13, no DMA function)
- *     - Ultra-lightweight non-blocking telephony & telemetry polling (Zero forks, Zero hangs)
- * - Pip-Boy 3000 Vault-Tec HUD (Cat S22 FLIP Edition):
- *     - Header: Cellular 4G signal bars, Wi-Fi wave icon, Hotspot beacon icon, "Cat S22 FLIP"
- *     - Center: Bold retro digital clock (HH:MM) with ticking seconds (:SS) and full date
- *     - Gauges: Live kernel BAT%, CPU%, RAM% telemetry bars
- *     - Footer: Rolling live logcat tail (last 2 lines)
- *     - In-Call HUDs:
- *         - Incoming: Amber alert header, caller ID, signal gauge, PTT answer prompt
- *         - Active: Comms link timer MM:SS, speaker routing, animated audio equalizer wave
- * - Logging: Writes operational log to /sdcard/CatLogs/outerscreen.log
- * - Pure C, zero external dependencies, zero root/Magisk required.
+ * Cat S22 Flip Outer OLED (128x128 fb2) Dynamic Display Daemon
+ * 
+ * - Full suite of 22 Watchfaces and 14 Call UI HUDs.
+ * - Scaled-down high-density UI layout.
+ * - Contact Name lookup from content://com.android.contacts.
+ * - Always-on 128x128 32-bit ARGB8888 framebuffer rendering.
  */
 
 #include <stdio.h>
@@ -27,45 +12,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <linux/fb.h>
+#include <time.h>
 #include <signal.h>
 #include <stdarg.h>
-
-/* === Logging === */
-#define LOG_PATH  "/sdcard/CatLogs/outerscreen.log"
-#define LOG_MAX   (256 * 1024)  /* rotate at 256 KB */
-
-static FILE *g_log_fp = NULL;
-
-static void log_open(void) {
-    /* Create log directory if needed */
-    mkdir("/sdcard/CatLogs", 0755);
-    /* Rotate if too large */
-    struct stat st;
-    if (stat(LOG_PATH, &st) == 0 && st.st_size > LOG_MAX) {
-        rename(LOG_PATH, LOG_PATH ".bak");
-    }
-    g_log_fp = fopen(LOG_PATH, "a");
-}
-
-static void outerlog(const char *fmt, ...) {
-    if (!g_log_fp) return;
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    char ts[32];
-    strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", t);
-    fprintf(g_log_fp, "[%s] ", ts);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(g_log_fp, fmt, ap);
-    va_end(ap);
-    fprintf(g_log_fp, "\n");
-    fflush(g_log_fp);
-}
+#include <sys/stat.h>
 
 #define FB_DEV          "/dev/graphics/fb2"
 #define BACKLIGHT_NODE  "/sys/devices/platform/soc/1a00000.qcom,mdss_mdp/1a00000.qcom,mdss_mdp:qcom,mdss_fb_secondary/leds/lcd-backlight2/brightness"
@@ -73,10 +26,6 @@ static void outerlog(const char *fmt, ...) {
 #define WAKELOCK_PATH   "/sys/power/wake_lock"
 #define WAKELOCK_NAME   "outerscreen_wakelock\n"
 
-/* Acquire a kernel wake lock to prevent SPI bus power gating during Android DOZE.
- * Root cause: When Android enters DOZE/sleep, the SPI bus is power-gated and
- * FBIOPAN_DISPLAY / FBIOPUT_VSCREENINFO fail with SPI Tx transaction timeout.
- * Holding a wake lock keeps the SPI bus powered continuously. */
 static void acquire_wakelock(void) {
     int fd = open(WAKELOCK_PATH, O_WRONLY);
     if (fd >= 0) {
@@ -85,17 +34,40 @@ static void acquire_wakelock(void) {
     }
 }
 
-// Fully opaque 32-bit ARGB8888 color palette (Full 0xFF alpha prevents white display inversion)
-#define COLOR_BLACK         0xFF000000
-#define COLOR_PIP_GREEN     0xFF10B981 /* Phosphor green #10b981 */
-#define COLOR_PIP_LIGHT     0xFFA7F3D0 /* Bright mint green #a7f3d0 */
-#define COLOR_PIP_DARK      0xFF064E3B /* Dark phosphor green #064e3b */
-#define COLOR_WHITE         0xFFFFFFFF
-#define COLOR_AMBER         0xFFF59E0B /* Amber warning #f59e0b */
-#define COLOR_RED           0xFFEF4444 /* Terminal danger red #ef4444 */
-#define COLOR_GRAY          0xFF334155
+static void set_backlight(int val) {
+    int fd = open(BACKLIGHT_NODE, O_WRONLY);
+    if (fd < 0) fd = open(BACKLIGHT_ALT, O_WRONLY);
+    if (fd >= 0) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d\n", val);
+        write(fd, buf, strlen(buf));
+        close(fd);
+    }
+}
 
-// 5x7 ASCII font table
+/* Colors (0xFF Alpha channel prevents display inversion) */
+#define COLOR_BLACK         0xFF000000
+#define COLOR_WHITE         0xFFFFFFFF
+#define COLOR_PIP_GREEN     0xFF10B981
+#define COLOR_PIP_LIGHT     0xFFA7F3D0
+#define COLOR_PIP_DARK      0xFF064E3B
+#define COLOR_AMBER         0xFFF59E0B
+#define COLOR_AMBER_BRIGHT  0xFFFBBF24
+#define COLOR_AMBER_DARK    0xFF78350F
+#define COLOR_RED           0xFFEF4444
+#define COLOR_RED_DARK      0xFF991B1B
+#define COLOR_GRAY          0xFF334155
+#define COLOR_GRAY_LIGHT    0xFF94A3B8
+#define COLOR_BLUE          0xFF3B82F6
+#define COLOR_CYAN          0xFF06B6D4
+#define COLOR_MAGENTA       0xFFEC4899
+#define COLOR_PURPLE        0xFFA855F7
+#define COLOR_YELLOW        0xFFEAB308
+#define COLOR_GB_BG         0xFF8BAC0F
+#define COLOR_GB_FG         0xFF0F380F
+#define COLOR_GB_MID        0xFF306230
+
+/* 5x7 ASCII font table */
 static const uint8_t font5x7[][5] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
     ['!'] = {0x00, 0x00, 0x5F, 0x00, 0x00},
@@ -161,37 +133,6 @@ static const uint8_t font5x7[][5] = {
     [']'] = {0x00, 0x41, 0x41, 0x7F, 0x00},
     ['^'] = {0x04, 0x02, 0x01, 0x02, 0x04},
     ['_'] = {0x40, 0x40, 0x40, 0x40, 0x40},
-    ['`'] = {0x00, 0x01, 0x02, 0x04, 0x00},
-    ['a'] = {0x20, 0x54, 0x54, 0x54, 0x78},
-    ['b'] = {0x7F, 0x48, 0x44, 0x44, 0x38},
-    ['c'] = {0x38, 0x44, 0x44, 0x44, 0x20},
-    ['d'] = {0x38, 0x44, 0x44, 0x48, 0x7F},
-    ['e'] = {0x38, 0x54, 0x54, 0x54, 0x18},
-    ['f'] = {0x08, 0x7E, 0x09, 0x01, 0x02},
-    ['g'] = {0x0C, 0x52, 0x52, 0x52, 0x3E},
-    ['h'] = {0x7F, 0x08, 0x04, 0x04, 0x78},
-    ['i'] = {0x00, 0x44, 0x7D, 0x40, 0x00},
-    ['j'] = {0x20, 0x40, 0x44, 0x3D, 0x00},
-    ['k'] = {0x7F, 0x10, 0x28, 0x44, 0x00},
-    ['l'] = {0x00, 0x41, 0x7F, 0x40, 0x00},
-    ['m'] = {0x7C, 0x04, 0x18, 0x04, 0x78},
-    ['n'] = {0x7C, 0x08, 0x04, 0x04, 0x78},
-    ['o'] = {0x38, 0x44, 0x44, 0x44, 0x38},
-    ['p'] = {0x7C, 0x14, 0x14, 0x14, 0x08},
-    ['q'] = {0x08, 0x14, 0x14, 0x18, 0x7C},
-    ['r'] = {0x7C, 0x08, 0x04, 0x04, 0x08},
-    ['s'] = {0x48, 0x54, 0x54, 0x54, 0x20},
-    ['t'] = {0x04, 0x3F, 0x44, 0x40, 0x20},
-    ['u'] = {0x3C, 0x40, 0x40, 0x20, 0x7C},
-    ['v'] = {0x1C, 0x20, 0x40, 0x20, 0x1C},
-    ['w'] = {0x3C, 0x40, 0x30, 0x40, 0x3C},
-    ['x'] = {0x44, 0x28, 0x10, 0x28, 0x44},
-    ['y'] = {0x0C, 0x50, 0x50, 0x50, 0x3C},
-    ['z'] = {0x44, 0x64, 0x54, 0x4C, 0x44},
-    ['{'] = {0x00, 0x08, 0x36, 0x41, 0x00},
-    ['|'] = {0x00, 0x00, 0x7F, 0x00, 0x00},
-    ['}'] = {0x00, 0x41, 0x36, 0x08, 0x00},
-    ['~'] = {0x08, 0x08, 0x2A, 0x1C, 0x08},
 };
 
 static void draw_pixel(uint32_t *fb, int x, int y, uint32_t color) {
@@ -200,16 +141,35 @@ static void draw_pixel(uint32_t *fb, int x, int y, uint32_t color) {
     }
 }
 
+static void fill_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
+    for (int cy = y; cy < y + h && cy < 128; cy++) {
+        if (cy < 0) continue;
+        for (int cx = x; cx < x + w && cx < 128; cx++) {
+            if (cx >= 0) fb[cy * 128 + cx] = color;
+        }
+    }
+}
+
+static void draw_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
+    for (int cx = x; cx < x + w; cx++) { draw_pixel(fb, cx, y, color); draw_pixel(fb, cx, y + h - 1, color); }
+    for (int cy = y; cy < y + h; cy++) { draw_pixel(fb, x, cy, color); draw_pixel(fb, x + w - 1, cy, color); }
+}
+
 static void draw_char(uint32_t *fb, int x, int y, char c, uint32_t color, int scale) {
-    if ((unsigned char)c > 127) c = ' ';
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if (c < 32 || c > 95) c = ' ';
     const uint8_t *glyph = font5x7[(int)c];
     for (int col = 0; col < 5; col++) {
         uint8_t line = glyph[col];
         for (int row = 0; row < 7; row++) {
             if (line & (1 << row)) {
-                for (int sx = 0; sx < scale; sx++) {
-                    for (int sy = 0; sy < scale; sy++) {
-                        draw_pixel(fb, x + col * scale + sx, y + row * scale + sy, color);
+                if (scale == 1) {
+                    draw_pixel(fb, x + col, y + row, color);
+                } else {
+                    for (int dy = 0; dy < scale; dy++) {
+                        for (int dx = 0; dx < scale; dx++) {
+                            draw_pixel(fb, x + col * scale + dx, y + row * scale + dy, color);
+                        }
                     }
                 }
             }
@@ -218,213 +178,135 @@ static void draw_char(uint32_t *fb, int x, int y, char c, uint32_t color, int sc
 }
 
 static void draw_string(uint32_t *fb, int x, int y, const char *str, uint32_t color, int scale) {
+    int cur_x = x;
     while (*str) {
-        draw_char(fb, x, y, *str, color, scale);
-        x += (5 + 1) * scale;
+        draw_char(fb, cur_x, y, *str, color, scale);
+        cur_x += 6 * scale;
         str++;
     }
 }
 
 static void draw_string_centered(uint32_t *fb, int y, const char *str, uint32_t color, int scale) {
     int len = strlen(str);
-    int total_width = len * 6 * scale;
-    int x = (128 - total_width) / 2;
+    int w = len * 6 * scale - scale;
+    int x = (128 - w) / 2;
     if (x < 0) x = 0;
     draw_string(fb, x, y, str, color, scale);
 }
 
-static void fill_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
-    for (int j = y; j < y + h; j++) {
-        for (int i = x; i < x + w; i++) {
-            draw_pixel(fb, i, j, color);
-        }
-    }
-}
-
-static void draw_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
-    for (int i = x; i < x + w; i++) {
-        draw_pixel(fb, i, y, color);
-        draw_pixel(fb, i, y + h - 1, color);
-    }
-    for (int j = y; j < y + h; j++) {
-        draw_pixel(fb, x, j, color);
-        draw_pixel(fb, x + w - 1, j, color);
-    }
-}
-
-static void draw_hline(uint32_t *fb, int x, int y, int len, uint32_t color) {
-    for (int i = 0; i < len; i++) draw_pixel(fb, x + i, y, color);
-}
-
 static void clear_screen(uint32_t *fb) {
-    for (int i = 0; i < 128 * 128; i++) {
-        fb[i] = COLOR_BLACK;
-    }
+    for (int i = 0; i < 128 * 128; i++) fb[i] = COLOR_BLACK;
 }
 
-static void set_backlight(int brightness) {
-    int fd = open(BACKLIGHT_NODE, O_WRONLY);
-    if (fd < 0) {
-        fd = open(BACKLIGHT_ALT, O_WRONLY);
-    }
-    if (fd >= 0) {
-        char buf[16];
-        int len = snprintf(buf, sizeof(buf), "%d\n", brightness);
-        write(fd, buf, len);
-        close(fd);
-    }
-}
-
-/* === System & Telemetry Pollers === */
 static int get_battery(void) {
-    FILE *fp = fopen("/sys/class/power_supply/battery/capacity", "r");
-    if (!fp) return 85;
-    int cap = 85;
-    if (fscanf(fp, "%d", &cap) != 1) cap = 85;
-    fclose(fp);
+    FILE *f = fopen("/sys/class/power_supply/battery/capacity", "r");
+    if (!f) return -1;
+    int cap = -1;
+    fscanf(f, "%d", &cap);
+    fclose(f);
     return cap;
 }
 
-static void get_battery_estimate(int cap, int cpu_pct, char *line1, size_t len1, char *line2, size_t len2) {
-    char status[32] = "Discharging";
-    FILE *fp = fopen("/sys/class/power_supply/battery/status", "r");
-    if (fp) {
-        if (fgets(status, sizeof(status), fp)) {
-            char *nl = strpbrk(status, "\r\n");
-            if (nl) *nl = '\0';
-        }
-        fclose(fp);
-    }
-
-    int cur_ua = 0;
-    fp = fopen("/sys/class/power_supply/battery/current_now", "r");
-    if (fp) {
-        if (fscanf(fp, "%d", &cur_ua) != 1) cur_ua = 0;
-        fclose(fp);
-    }
-    int cur_ma = abs(cur_ua) / 1000;
-    if (cur_ma == 0 && abs(cur_ua) > 0) cur_ma = abs(cur_ua);
-
-    if (strncmp(status, "Full", 4) == 0 || (strncmp(status, "Charging", 8) == 0 && cap >= 100)) {
-        snprintf(line1, len1, "> BAT: FULL (100%%)");
-        snprintf(line2, len2, "> AC POWER CONNECTED");
-        return;
-    }
-
-    if (strncmp(status, "Charging", 8) == 0) {
-        /* 2000 mAh cell: estimate time to 100% */
-        int rem_pct = 100 - cap;
-        int rate_ma = (cur_ma >= 80 && cur_ma <= 2000) ? cur_ma : 550;
-        int mins_to_full = (rem_pct * 20 * 60) / rate_ma;
-        int h = mins_to_full / 60;
-        int m = mins_to_full % 60;
-        snprintf(line1, len1, "> CHG: +%dh %02dm FULL", h, m);
-        snprintf(line2, len2, "> LEVEL:%d%%  +%dmA", cap, rate_ma);
-        return;
-    }
-
-    /* Discharging: Cat S22 Flip 2000 mAh battery
-     * Use real current_now if valid (25..1500 mA), otherwise estimate from CPU load (~48 mA idle + 3.5 mA per CPU%) */
-    int drain_ma = (cur_ma >= 25 && cur_ma <= 1500) ? cur_ma : (48 + (cpu_pct * 3));
-    int rem_mah = (cap * 20); /* 2000 mAh * cap / 100 */
-    int total_mins = (rem_mah * 60) / drain_ma;
-    int hrs = total_mins / 60;
-    int mins = total_mins % 60;
-
-    if (hrs >= 24) {
-        int days = hrs / 24;
-        int rem_h = hrs % 24;
-        snprintf(line1, len1, "> EST: ~%dd %dh LEFT", days, rem_h);
-    } else {
-        snprintf(line1, len1, "> EST: ~%dh %02dm LEFT", hrs, mins);
-    }
-    snprintf(line2, len2, "> %d%% (%dmAh) -%dmA", cap, rem_mah, drain_ma);
-}
-
 static int get_cpu_usage(void) {
-    static unsigned long long prev_total = 0, prev_work = 0;
-    FILE *fp = fopen("/proc/stat", "r");
-    if (!fp) return 5;
-
-    unsigned long long user = 0, nice = 0, sys = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
-    char cpu_label[8];
-    if (fscanf(fp, "%7s %llu %llu %llu %llu %llu %llu %llu %llu",
-               cpu_label, &user, &nice, &sys, &idle, &iowait, &irq, &softirq, &steal) < 5) {
-        fclose(fp);
-        return 5;
-    }
-    fclose(fp);
-
-    unsigned long long total = user + nice + sys + idle + iowait + irq + softirq + steal;
-    unsigned long long work  = user + nice + sys + irq + softirq + steal;
-
-    unsigned long long total_diff = total - prev_total;
-    unsigned long long work_diff  = work  - prev_work;
-
-    prev_total = total;
-    prev_work  = work;
-
-    if (total_diff == 0) return 5;
-    int pct = (int)((work_diff * 100) / total_diff);
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    return pct;
+    static unsigned long prev_user = 0, prev_nice = 0, prev_sys = 0, prev_idle = 0;
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return 0;
+    unsigned long user, nice, sys, idle;
+    char cpu[8];
+    fscanf(f, "%s %lu %lu %lu %lu", cpu, &user, &nice, &sys, &idle);
+    fclose(f);
+    unsigned long diff_user = user - prev_user;
+    unsigned long diff_nice = nice - prev_nice;
+    unsigned long diff_sys = sys - prev_sys;
+    unsigned long diff_idle = idle - prev_idle;
+    prev_user = user; prev_nice = nice; prev_sys = sys; prev_idle = idle;
+    unsigned long total = diff_user + diff_nice + diff_sys + diff_idle;
+    if (total == 0) return 0;
+    return (int)(((diff_user + diff_nice + diff_sys) * 100) / total);
 }
 
 static int get_ram_usage(void) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return 50;
-
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    unsigned long total = 0, free = 0, buffers = 0, cached = 0;
     char line[128];
-    long total_kb = 0, avail_kb = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line + 9, "%ld", &total_kb);
-        else if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line + 13, "%ld", &avail_kb);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line + 9, "%lu", &total);
+        else if (strncmp(line, "MemFree:", 8) == 0) sscanf(line + 8, "%lu", &free);
+        else if (strncmp(line, "Buffers:", 8) == 0) sscanf(line + 8, "%lu", &buffers);
+        else if (strncmp(line, "Cached:", 7) == 0) sscanf(line + 7, "%lu", &cached);
     }
-    fclose(fp);
-
-    if (total_kb <= 0) return 50;
-    int pct = (int)(((total_kb - avail_kb) * 100) / total_kb);
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    return pct;
+    fclose(f);
+    if (total == 0) return 0;
+    unsigned long used = total - (free + buffers + cached);
+    return (int)((used * 100) / total);
 }
 
-static int is_wifi_connected(void) {
-    FILE *fp = fopen("/proc/net/route", "r");
+/* Contact Lookup */
+static void lookup_contact_name(const char *number, char *out_name, size_t max_len) {
+    if (!number || !number[0]) {
+        snprintf(out_name, max_len, "UNKNOWN");
+        return;
+    }
+    out_name[0] = '\0';
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "content query --uri content://com.android.contacts/phone_lookup/%s --projection display_name 2>/dev/null", number);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char line[256];
+        if (fgets(line, sizeof(line), fp)) {
+            char *p = strstr(line, "display_name=");
+            if (p) {
+                p += 13;
+                char *comma = strchr(p, ',');
+                if (comma) *comma = '\0';
+                char *nl = strpbrk(p, "\r\n");
+                if (nl) *nl = '\0';
+                snprintf(out_name, max_len, "%s", p);
+            }
+        }
+        pclose(fp);
+    }
+    if (!out_name[0]) {
+        snprintf(out_name, max_len, "%s", number);
+    }
+}
+
+/* Telephony poll */
+static int poll_telephony(char *caller_num, size_t max_len) {
+    FILE *fp = popen("dumpsys telephony.registry 2>/dev/null", "r");
     if (!fp) return 0;
-    char line[128];
-    int connected = 0;
+
+    char line[256];
+    int call_state = 0; // 0 = IDLE, 1 = RINGING, 2 = OFFHOOK
+    int lines_read = 0;
+    if (caller_num && max_len > 0) caller_num[0] = '\0';
+
     while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "wlan0")) {
-            connected = 1;
-            break;
+        lines_read++;
+        if (lines_read <= 45) {
+            if (strstr(line, "mCallState=1") || strstr(line, "mRingingCallState=1")) {
+                call_state = 1;
+            } else if (strstr(line, "mCallState=2") || strstr(line, "mForegroundCallState=1")) {
+                call_state = 2;
+            }
+
+            char *incoming = strstr(line, "mCallIncomingNumber=");
+            if (incoming && caller_num && max_len > 0 && !caller_num[0]) {
+                sscanf(incoming, "mCallIncomingNumber=%s", caller_num);
+            }
         }
     }
-    fclose(fp);
-    return connected;
+    pclose(fp);
+    return call_state;
 }
 
-static int is_hotspot_active(void) {
-    FILE *fp = fopen("/proc/net/arp", "r");
-    if (!fp) return 0;
-    char line[128];
-    int count = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "wlan0") && strstr(line, "0x2")) {
-            count++;
-        }
-    }
-    fclose(fp);
-    return count > 0;
-}
-
-/* === Live logcat tail (non-blocking, 2-line rolling display) === */
-#define LOGLINE_W 21   /* chars per display line (128px / 6px per char) */
-static char live_log[2][LOGLINE_W + 1];
+/* Preferences from /dev/shm_outerscreen_cmd */
 static int  cfg_outer_enabled    = 1;
 static int  cfg_outer_brightness = 255;
-static char cfg_outer_footer[16] = "logcat";
+static char cfg_outer_theme[32]  = "pipboy";
+static char cfg_outer_call[32]   = "pipboy";
+static char cfg_outer_footer[32] = "battery";
 
 static void load_outer_config(void) {
     FILE *fp = fopen("/dev/shm_outerscreen_cmd", "r");
@@ -438,6 +320,10 @@ static void load_outer_config(void) {
         } else if (strncmp(line, "outer_brightness=", 17) == 0) {
             int br = atoi(line + 17);
             if (br >= 10 && br <= 255) cfg_outer_brightness = br;
+        } else if (strncmp(line, "outer_theme=", 12) == 0) {
+            snprintf(cfg_outer_theme, sizeof(cfg_outer_theme), "%s", line + 12);
+        } else if (strncmp(line, "outer_call_theme=", 17) == 0) {
+            snprintf(cfg_outer_call, sizeof(cfg_outer_call), "%s", line + 17);
         } else if (strncmp(line, "outer_footer=", 13) == 0) {
             snprintf(cfg_outer_footer, sizeof(cfg_outer_footer), "%s", line + 13);
         }
@@ -445,134 +331,415 @@ static void load_outer_config(void) {
     fclose(fp);
 }
 
-/* Poll last 2 logcat lines (brief, non-blocking via popen with head) */
-static void poll_live_log(void) {
-    /* logcat -d: dump current buffer, no follow; -T 4 lines, pick last 2 */
-    FILE *fp = popen("logcat -d -v brief -T 4 '*:W' 2>/dev/null | tail -n 2", "r");
-    if (!fp) return;
+/* === RENDERING ENGINES === */
 
-    char buf[256];
-    int idx = 0;
-    while (fgets(buf, sizeof(buf), fp) && idx < 2) {
-        /* Strip priority/tag prefix: keep only the message part after ": " */
-        const char *msg = strstr(buf, "): ");
-        if (msg) msg += 3; else msg = buf;
-        /* Trim newline */
-        int len = 0;
-        while (msg[len] && msg[len] != '\n' && msg[len] != '\r') len++;
-        /* Copy up to LOGLINE_W printable chars */
-        int out = 0;
-        for (int i = 0; i < len && out < LOGLINE_W; i++) {
-            if ((unsigned char)msg[i] >= 32 && (unsigned char)msg[i] <= 126)
-                live_log[idx][out++] = msg[i];
+/* Common compact header */
+static void draw_status_bar(uint32_t *fb, const char *title, uint32_t color, int bat) {
+    draw_string(fb, 2, 2, "4G", color, 1);
+    draw_string_centered(fb, 2, title, color, 1);
+    char bat_buf[8];
+    snprintf(bat_buf, sizeof(bat_buf), "%d%%", bat >= 0 ? bat : 0);
+    draw_string(fb, 126 - (int)strlen(bat_buf) * 6, 2, bat_buf, color, 1);
+    fill_rect(fb, 2, 11, 124, 1, color);
+}
+
+/* 22 WATCHFACES (Compact Scaled-Down UI) */
+static void render_watchface(uint32_t *fb, const char *theme, struct tm *tm, int bat, int cpu, int ram) {
+    char time_str[16];
+    char date_str[32];
+    strftime(time_str, sizeof(time_str), "%H:%M", tm);
+    strftime(date_str, sizeof(date_str), "%a, %b %d", tm);
+    for (int i = 0; date_str[i]; i++) if (date_str[i] >= 'a' && date_str[i] <= 'z') date_str[i] -= 32;
+
+    if (strcmp(theme, "gshock") == 0) {
+        fill_rect(fb, 0, 0, 128, 128, COLOR_BLACK);
+        draw_rect(fb, 1, 1, 126, 126, COLOR_GRAY);
+        draw_status_bar(fb, "G-SHOCK", COLOR_WHITE, bat);
+        draw_string_centered(fb, 24, date_str, COLOR_GRAY_LIGHT, 1);
+        draw_string_centered(fb, 38, time_str, COLOR_WHITE, 3);
+        char sec_buf[8]; snprintf(sec_buf, sizeof(sec_buf), ":%02d", tm->tm_sec);
+        draw_string(fb, 100, 48, sec_buf, COLOR_YELLOW, 1);
+        draw_string_centered(fb, 74, "WR 20BAR - TOUGH", COLOR_YELLOW, 1);
+        fill_rect(fb, 14, 94, (bat * 100) / 100, 6, COLOR_RED);
+        draw_rect(fb, 14, 94, 100, 6, COLOR_GRAY_LIGHT);
+        draw_string_centered(fb, 110, "CAT S22 FLIP", COLOR_GRAY_LIGHT, 1);
+
+    } else if (strcmp(theme, "doom") == 0) {
+        draw_status_bar(fb, "DOOM SLAYER", COLOR_RED, bat);
+        draw_string_centered(fb, 22, time_str, COLOR_RED, 3);
+        draw_string_centered(fb, 52, "E1M1: HANGAR", COLOR_AMBER, 1);
+        char stats[32]; snprintf(stats, sizeof(stats), "HLT:%3d%%  ARM:%3d%%", bat, ram);
+        draw_string_centered(fb, 70, stats, COLOR_WHITE, 1);
+        char ammo[32]; snprintf(ammo, sizeof(ammo), "AMMO: %02d / BFG", cpu);
+        draw_string_centered(fb, 86, ammo, COLOR_YELLOW, 1);
+        fill_rect(fb, 10, 106, (bat * 108) / 100, 6, COLOR_RED);
+        draw_rect(fb, 10, 106, 108, 6, COLOR_RED_DARK);
+
+    } else if (strcmp(theme, "lcars") == 0) {
+        fill_rect(fb, 0, 0, 16, 128, COLOR_AMBER);
+        fill_rect(fb, 16, 0, 112, 12, COLOR_AMBER_BRIGHT);
+        draw_string(fb, 20, 2, "STARFLEET LCARS", COLOR_BLACK, 1);
+        draw_string(fb, 22, 26, time_str, COLOR_WHITE, 3);
+        draw_string(fb, 22, 56, date_str, COLOR_AMBER, 1);
+        char stardate[32]; snprintf(stardate, sizeof(stardate), "SD: 47634.%d", tm->tm_yday);
+        draw_string(fb, 22, 74, stardate, COLOR_PURPLE, 1);
+        char warp[32]; snprintf(warp, sizeof(warp), "WARP CORE: %d%%", bat);
+        draw_string(fb, 22, 92, warp, COLOR_CYAN, 1);
+        draw_string(fb, 22, 110, "SYS: NOMINAL", COLOR_AMBER, 1);
+
+    } else if (strcmp(theme, "amber") == 0) {
+        draw_status_bar(fb, "AMBER TELEMETRY", COLOR_AMBER, bat);
+        draw_string_centered(fb, 26, time_str, COLOR_AMBER_BRIGHT, 3);
+        draw_string_centered(fb, 56, date_str, COLOR_AMBER, 1);
+        char telem[32]; snprintf(telem, sizeof(telem), "CPU:%d%% RAM:%d%%", cpu, ram);
+        draw_string_centered(fb, 74, telem, COLOR_AMBER, 1);
+        fill_rect(fb, 14, 94, (bat * 100) / 100, 4, COLOR_AMBER);
+        draw_rect(fb, 14, 94, 100, 4, COLOR_AMBER_DARK);
+        draw_string_centered(fb, 110, "POWER 88% NOMINAL", COLOR_AMBER, 1);
+
+    } else if (strcmp(theme, "matrix") == 0) {
+        draw_string(fb, 2, 2, "101001", COLOR_PIP_DARK, 1);
+        draw_string(fb, 80, 2, "01101", COLOR_PIP_DARK, 1);
+        draw_string_centered(fb, 24, time_str, COLOR_PIP_GREEN, 3);
+        draw_string_centered(fb, 54, date_str, COLOR_PIP_LIGHT, 1);
+        draw_string_centered(fb, 72, "WAKE UP, NEO...", COLOR_PIP_GREEN, 1);
+        draw_string_centered(fb, 90, "MATRIX HAS YOU", COLOR_PIP_DARK, 1);
+        char bat_m[32]; snprintf(bat_m, sizeof(bat_m), "NODE BAT: %d%%", bat);
+        draw_string_centered(fb, 108, bat_m, COLOR_PIP_GREEN, 1);
+
+    } else if (strcmp(theme, "cat") == 0) {
+        fill_rect(fb, 0, 0, 128, 12, COLOR_YELLOW);
+        draw_string(fb, 4, 2, "CAT S22 HEAVY DUTY", COLOR_BLACK, 1);
+        draw_string_centered(fb, 26, time_str, COLOR_WHITE, 3);
+        draw_string_centered(fb, 56, date_str, COLOR_YELLOW, 1);
+        fill_rect(fb, 4, 76, 120, 12, COLOR_YELLOW);
+        draw_string_centered(fb, 78, "BUILT FOR IT", COLOR_BLACK, 1);
+        char diesel[32]; snprintf(diesel, sizeof(diesel), "POWER CELL: %d%%", bat);
+        draw_string_centered(fb, 98, diesel, COLOR_WHITE, 1);
+        draw_string_centered(fb, 112, "IP68 RUGGED FLIP", COLOR_GRAY_LIGHT, 1);
+
+    } else if (strcmp(theme, "radar") == 0) {
+        draw_status_bar(fb, "TACTICAL RADAR", COLOR_CYAN, bat);
+        draw_rect(fb, 40, 20, 48, 48, COLOR_PIP_DARK);
+        draw_string_centered(fb, 36, time_str, COLOR_WHITE, 2);
+        draw_string_centered(fb, 74, "HDG 084 SWEEP", COLOR_CYAN, 1);
+        char coords[32]; snprintf(coords, sizeof(coords), "GRID 48N-11E %d%%", bat);
+        draw_string_centered(fb, 92, coords, COLOR_PIP_LIGHT, 1);
+        draw_string_centered(fb, 110, "TARGET ACQUIRED", COLOR_PIP_GREEN, 1);
+
+    } else if (strcmp(theme, "synthwave") == 0) {
+        draw_status_bar(fb, "SYNTHWAVE 84", COLOR_MAGENTA, bat);
+        draw_string_centered(fb, 26, time_str, COLOR_MAGENTA, 3);
+        draw_string_centered(fb, 56, date_str, COLOR_CYAN, 1);
+        fill_rect(fb, 0, 78, 128, 1, COLOR_PURPLE);
+        draw_string_centered(fb, 88, "OUTRUN HIGHWAY", COLOR_MAGENTA, 1);
+        char neon[32]; snprintf(neon, sizeof(neon), "NEON POWER: %d%%", bat);
+        draw_string_centered(fb, 108, neon, COLOR_CYAN, 1);
+
+    } else if (strcmp(theme, "lcd") == 0) {
+        fill_rect(fb, 0, 0, 128, 128, COLOR_GRAY_LIGHT);
+        draw_string(fb, 4, 4, "CASIO", COLOR_BLACK, 1);
+        draw_string(fb, 70, 4, date_str, COLOR_BLACK, 1);
+        draw_string_centered(fb, 30, time_str, COLOR_BLACK, 3);
+        char f91[32]; snprintf(f91, sizeof(f91), "ALARM CHRONO %d%%", bat);
+        draw_string_centered(fb, 64, f91, COLOR_BLACK, 1);
+        draw_string_centered(fb, 86, "WATER RESIST", COLOR_BLACK, 1);
+        draw_string_centered(fb, 108, "LITHIUM", COLOR_BLACK, 1);
+
+    } else if (strcmp(theme, "nothing") == 0) {
+        draw_status_bar(fb, "(1)", COLOR_WHITE, bat);
+        draw_string_centered(fb, 28, time_str, COLOR_WHITE, 3);
+        draw_string_centered(fb, 60, date_str, COLOR_GRAY_LIGHT, 1);
+        draw_string_centered(fb, 80, "NOTHING (R)", COLOR_WHITE, 1);
+        char gly[32]; snprintf(gly, sizeof(gly), "GLYPH: %d%%", bat);
+        draw_string_centered(fb, 104, gly, COLOR_GRAY_LIGHT, 1);
+
+    } else if (strcmp(theme, "mono") == 0) {
+        /* Stark OLED Mono */
+        draw_string_centered(fb, 30, time_str, COLOR_WHITE, 3);
+        draw_string_centered(fb, 64, date_str, COLOR_GRAY_LIGHT, 1);
+        char bat_mono[32]; snprintf(bat_mono, sizeof(bat_mono), "%d%% BATTERY", bat);
+        draw_string_centered(fb, 88, bat_mono, COLOR_WHITE, 1);
+
+    } else if (strcmp(theme, "vegas") == 0) {
+        /* Pip-Boy Amber New Vegas */
+        draw_status_bar(fb, "MOJAVE WASTELAND", COLOR_AMBER, bat);
+        draw_string_centered(fb, 24, time_str, COLOR_AMBER_BRIGHT, 3);
+        draw_string_centered(fb, 54, "NEW VEGAS // OCT 31", COLOR_AMBER, 1);
+        char veg[32]; snprintf(veg, sizeof(veg), "HP:%d%%  AP:95", bat);
+        draw_string_centered(fb, 72, veg, COLOR_AMBER_BRIGHT, 1);
+        draw_string_centered(fb, 90, "RAD: 0  CAPS:1420", COLOR_AMBER, 1);
+        draw_string_centered(fb, 108, "> PIP-BOY 3000-A", COLOR_AMBER_DARK, 1);
+
+    } else if (strcmp(theme, "agent007") == 0) {
+        /* GoldenEye 007 */
+        fill_rect(fb, 2, 20, 10, (bat * 80) / 100, COLOR_BLUE);
+        draw_rect(fb, 2, 20, 10, 80, COLOR_WHITE);
+        fill_rect(fb, 16, 20, 10, (ram * 80) / 100, COLOR_RED);
+        draw_rect(fb, 16, 20, 10, 80, COLOR_WHITE);
+        draw_string(fb, 32, 10, "MI6 COVERT HUD", COLOR_BLUE, 1);
+        draw_string(fb, 32, 34, time_str, COLOR_WHITE, 2);
+        draw_string(fb, 32, 58, date_str, COLOR_CYAN, 1);
+        draw_string(fb, 32, 78, "MISSION STATUS", COLOR_YELLOW, 1);
+        draw_string(fb, 32, 92, "OBJECTIVE: 100%", COLOR_PIP_GREEN, 1);
+        draw_string(fb, 32, 110, "LASER WATCH OK", COLOR_WHITE, 1);
+
+    } else if (strcmp(theme, "gameboy") == 0) {
+        /* Nintendo DMG-01 */
+        fill_rect(fb, 0, 0, 128, 128, COLOR_GB_BG);
+        draw_string(fb, 4, 4, "DOT MATRIX", COLOR_GB_FG, 1);
+        char gb_bat[16]; snprintf(gb_bat, sizeof(gb_bat), "BAT:%d%%", bat);
+        draw_string(fb, 76, 4, gb_bat, COLOR_GB_FG, 1);
+        draw_string_centered(fb, 30, time_str, COLOR_GB_FG, 3);
+        draw_string_centered(fb, 64, date_str, COLOR_GB_MID, 1);
+        draw_string_centered(fb, 86, "HIGH SCORE 88400", COLOR_GB_FG, 1);
+        draw_string_centered(fb, 106, "GAME BOY (TM)", COLOR_GB_MID, 1);
+
+    } else if (strcmp(theme, "arasaka") == 0) {
+        /* Night City Cyberware */
+        draw_status_bar(fb, "ARASAKA CYBER", COLOR_RED, bat);
+        draw_string_centered(fb, 26, time_str, COLOR_WHITE, 3);
+        draw_string_centered(fb, 56, "SANDEVISTAN: OK", COLOR_RED, 1);
+        char neural[32]; snprintf(neural, sizeof(neural), "NEURAL SYNC: %d%%", bat);
+        draw_string_centered(fb, 76, neural, COLOR_AMBER, 1);
+        fill_rect(fb, 10, 94, 108, 12, COLOR_RED_DARK);
+        draw_string_centered(fb, 96, "SUB-DERMAL LVL 4", COLOR_WHITE, 1);
+        draw_string_centered(fb, 112, "SEC: CLASSIFIED", COLOR_RED, 1);
+
+    } else if (strcmp(theme, "terminal") == 0) {
+        /* Linux Terminal */
+        draw_string(fb, 2, 2, "root@cat-s22:~#", COLOR_BLUE, 1);
+        draw_string(fb, 2, 16, time_str, COLOR_WHITE, 2);
+        draw_string(fb, 2, 36, date_str, COLOR_PIP_GREEN, 1);
+        char up[32]; snprintf(up, sizeof(up), "bat: %d%% temp: 31C", bat);
+        draw_string(fb, 2, 54, up, COLOR_PIP_LIGHT, 1);
+        char load[32]; snprintf(load, sizeof(load), "cpu: %d%% ram: %d%%", cpu, ram);
+        draw_string(fb, 2, 72, load, COLOR_AMBER, 1);
+        draw_string(fb, 2, 90, "kernel: 4.9.227-cat", COLOR_GRAY_LIGHT, 1);
+        draw_string(fb, 2, 108, "bash$ _", COLOR_PIP_GREEN, 1);
+
+    } else if (strcmp(theme, "cockpit") == 0) {
+        /* Glass Cockpit */
+        draw_status_bar(fb, "PFD HORIZON", COLOR_CYAN, bat);
+        fill_rect(fb, 0, 50, 128, 1, COLOR_CYAN);
+        fill_rect(fb, 54, 50, 20, 2, COLOR_YELLOW);
+        draw_string_centered(fb, 22, time_str, COLOR_WHITE, 2);
+        draw_string(fb, 4, 60, "ALT 320", COLOR_PIP_GREEN, 1);
+        draw_string(fb, 76, 60, "HDG 084", COLOR_PIP_GREEN, 1);
+        draw_string_centered(fb, 80, "MACH 0.82 // FL340", COLOR_YELLOW, 1);
+        draw_string_centered(fb, 100, "AP: ENGAGED GPS-1", COLOR_CYAN, 1);
+
+    } else if (strcmp(theme, "diver") == 0) {
+        /* Sub Aqua Diver */
+        draw_status_bar(fb, "DIVER 300M", COLOR_CYAN, bat);
+        draw_string_centered(fb, 24, time_str, COLOR_WHITE, 3);
+        draw_string_centered(fb, 56, "DEPTH: 28M  NDL:42M", COLOR_CYAN, 1);
+        char tank[32]; snprintf(tank, sizeof(tank), "O2 TANK: %d BAR", (bat * 2));
+        draw_string_centered(fb, 76, tank, COLOR_PIP_LIGHT, 1);
+        draw_string_centered(fb, 94, "DIVE TIME: 34:10", COLOR_YELLOW, 1);
+        draw_string_centered(fb, 110, "SAFETY STOP OK", COLOR_PIP_GREEN, 1);
+
+    } else if (strcmp(theme, "cybersynth") == 0) {
+        /* Outrun Cyber Synth */
+        draw_status_bar(fb, "OUTRUN SYNTH", COLOR_MAGENTA, bat);
+        draw_string_centered(fb, 26, time_str, COLOR_MAGENTA, 3);
+        draw_string_centered(fb, 56, date_str, COLOR_PURPLE, 1);
+        draw_string_centered(fb, 76, "NEON GRID // 88%", COLOR_CYAN, 1);
+        draw_string_centered(fb, 94, "CRUISING 120 MPH", COLOR_MAGENTA, 1);
+        draw_string_centered(fb, 110, "RETRO WAVE OK", COLOR_PURPLE, 1);
+
+    } else if (strcmp(theme, "steampunk") == 0) {
+        /* Steampunk Brass */
+        draw_status_bar(fb, "CHRONOMETER", COLOR_AMBER, bat);
+        draw_string_centered(fb, 24, time_str, COLOR_WHITE, 2);
+        draw_string_centered(fb, 46, "X : XLV", COLOR_AMBER_BRIGHT, 2);
+        draw_string_centered(fb, 70, date_str, COLOR_AMBER, 1);
+        char psi[32]; snprintf(psi, sizeof(psi), "BOILER: %d PSI", 100 + bat);
+        draw_string_centered(fb, 88, psi, COLOR_AMBER_BRIGHT, 1);
+        draw_string_centered(fb, 108, "STEAM REGULATOR", COLOR_AMBER_DARK, 1);
+
+    } else if (strcmp(theme, "solar") == 0) {
+        /* Solar Horizon */
+        draw_string_centered(fb, 20, time_str, COLOR_WHITE, 3);
+        draw_string_centered(fb, 52, date_str, COLOR_AMBER, 1);
+        draw_string_centered(fb, 72, "SUNRISE: 06:14", COLOR_YELLOW, 1);
+        draw_string_centered(fb, 90, "SUNSET : 18:24", COLOR_AMBER_DARK, 1);
+        char sol_b[32]; snprintf(sol_b, sizeof(sol_b), "SOLAR BAT: %d%%", bat);
+        draw_string_centered(fb, 108, sol_b, COLOR_WHITE, 1);
+
+    } else {
+        /* Pip-Boy 3000 (Default) */
+        draw_status_bar(fb, "Cat S22 FLIP", COLOR_PIP_GREEN, bat);
+        draw_string(fb, 10, 22, time_str, COLOR_WHITE, 3);
+        char sec_buf[8]; snprintf(sec_buf, sizeof(sec_buf), ":%02d", tm->tm_sec);
+        draw_string(fb, 102, 34, sec_buf, COLOR_PIP_GREEN, 1);
+        draw_string_centered(fb, 48, date_str, COLOR_PIP_LIGHT, 1);
+        fill_rect(fb, 2, 58, 124, 1, COLOR_PIP_DARK);
+
+        /* Telemetry */
+        char telem_b[32];
+        snprintf(telem_b, sizeof(telem_b), "BAT: %3d%% [||||||||]", bat >= 0 ? bat : 0);
+        draw_string(fb, 4, 64, telem_b, COLOR_PIP_GREEN, 1);
+        char telem_c[32];
+        snprintf(telem_c, sizeof(telem_c), "CPU: %3d%% [||||    ]", cpu);
+        draw_string(fb, 4, 76, telem_c, COLOR_PIP_LIGHT, 1);
+        char telem_r[32];
+        snprintf(telem_r, sizeof(telem_r), "RAM: %3d%% [||||||  ]", ram);
+        draw_string(fb, 4, 88, telem_r, COLOR_PIP_LIGHT, 1);
+
+        fill_rect(fb, 2, 100, 124, 1, COLOR_PIP_DARK);
+        if (strcmp(cfg_outer_footer, "battery") == 0) {
+            char est[32];
+            int hrs = (bat * 14) / 100;
+            snprintf(est, sizeof(est), "EST: %dh LEFT (PWR OK)", hrs > 0 ? hrs : 1);
+            draw_string(fb, 4, 106, est, COLOR_PIP_GREEN, 1);
+            draw_string(fb, 4, 116, "VAULT-TEC CAT-S22", COLOR_PIP_LIGHT, 1);
+        } else {
+            draw_string(fb, 4, 106, "> SYS:ONLINE LTE:OK", COLOR_PIP_GREEN, 1);
+            draw_string(fb, 4, 116, "> SECURE DUAL-SCREEN", COLOR_PIP_LIGHT, 1);
         }
-        live_log[idx][out] = '\0';
-        idx++;
     }
-    /* Pad any unpopulated lines */
-    for (; idx < 2; idx++) live_log[idx][0] = '\0';
-    pclose(fp);
 }
 
-/* Fast, non-blocking telephony state poller (zero pipe breakage) */
-static int poll_telephony(char *caller_num, size_t max_len) {
-    FILE *fp = popen("dumpsys telephony.registry 2>/dev/null", "r");
-    if (!fp) return 0;
+/* 14 CALL UI HUDS (Scaled-Down with Contact Name & Phone Number) */
+static void render_call_hud(uint32_t *fb, const char *theme, int call_state, const char *num, const char *name, long duration) {
+    char dur_str[16];
+    snprintf(dur_str, sizeof(dur_str), "%02ld:%02ld", duration / 60, duration % 60);
 
-    char line[256];
-    int call_state = 0; // 0 = IDLE, 1 = RINGING, 2 = OFFHOOK
-    int lines_read = 0;
-    if (caller_num && max_len > 0) caller_num[0] = '\0';
+    /* Clean display name up to 14 chars */
+    char disp_name[16];
+    snprintf(disp_name, sizeof(disp_name), "%.14s", (name && name[0]) ? name : ((num && num[0]) ? num : "UNKNOWN"));
 
-    while (fgets(line, sizeof(line), fp)) {
-        lines_read++;
-        if (lines_read <= 40) {
-            if (strstr(line, "mCallState=1") || strstr(line, "mRingingCallState=1")) {
-                call_state = 1;
-            } else if (strstr(line, "mCallState=2") || strstr(line, "mForegroundCallState=1")) {
-                call_state = 2;
-            }
+    char disp_num[16];
+    snprintf(disp_num, sizeof(disp_num), "%.14s", (num && num[0]) ? num : "");
 
-            char *incoming = strstr(line, "mCallIncomingNumber=");
-            if (incoming && caller_num && max_len > 0) {
-                sscanf(incoming, "mCallIncomingNumber=%s", caller_num);
-            }
+    if (strcmp(theme, "red_alert") == 0) {
+        fill_rect(fb, 0, 0, 128, 16, COLOR_RED);
+        draw_string_centered(fb, 4, call_state == 1 ? "RED ALERT CALL" : "ACTIVE COMMS", COLOR_WHITE, 1);
+        draw_string_centered(fb, 24, disp_name, COLOR_WHITE, 2);
+        if (disp_num[0]) draw_string_centered(fb, 44, disp_num, COLOR_AMBER, 1);
+        if (call_state == 2) draw_string_centered(fb, 60, dur_str, COLOR_WHITE, 2);
+        fill_rect(fb, 6, 88, 116, 16, COLOR_RED);
+        draw_string_centered(fb, 92, call_state == 1 ? "PTT: ANSWER" : "PTT: HANG UP", COLOR_WHITE, 1);
+        draw_string_centered(fb, 112, "RED KEY: REJECT", COLOR_RED, 1);
+
+    } else if (strcmp(theme, "cyberpunk") == 0 || strcmp(theme, "holo") == 0) {
+        fill_rect(fb, 0, 0, 128, 16, COLOR_CYAN);
+        draw_string_centered(fb, 4, "NEURAL HOLO-LINK", COLOR_BLACK, 1);
+        draw_string_centered(fb, 24, disp_name, COLOR_MAGENTA, 2);
+        if (disp_num[0]) draw_string_centered(fb, 44, disp_num, COLOR_CYAN, 1);
+        if (call_state == 2) draw_string_centered(fb, 58, dur_str, COLOR_WHITE, 2);
+        draw_string_centered(fb, 76, "HD AUDIO VOLTE", COLOR_PIP_LIGHT, 1);
+        fill_rect(fb, 6, 92, 116, 16, COLOR_MAGENTA);
+        draw_string_centered(fb, 96, "CONNECT COMM", COLOR_WHITE, 1);
+        draw_string_centered(fb, 114, "NIGHT CITY LINK", COLOR_GRAY_LIGHT, 1);
+
+    } else if (strcmp(theme, "cat_radio") == 0 || strcmp(theme, "walkie") == 0) {
+        fill_rect(fb, 0, 0, 128, 16, COLOR_YELLOW);
+        draw_string_centered(fb, 4, "CAT PTT DIRECT CH04", COLOR_BLACK, 1);
+        draw_string_centered(fb, 26, disp_name, COLOR_WHITE, 2);
+        if (disp_num[0]) draw_string_centered(fb, 46, disp_num, COLOR_YELLOW, 1);
+        if (call_state == 2) draw_string_centered(fb, 60, dur_str, COLOR_WHITE, 2);
+        draw_string_centered(fb, 78, "SQ: -98dBm  TX:OK", COLOR_YELLOW, 1);
+        fill_rect(fb, 6, 94, 116, 16, COLOR_YELLOW);
+        draw_string_centered(fb, 98, "HOLD PTT: TRANSMIT", COLOR_BLACK, 1);
+        draw_string_centered(fb, 114, "HEAVY DUTY AUDIO", COLOR_GRAY_LIGHT, 1);
+
+    } else if (strcmp(theme, "cassette") == 0) {
+        fill_rect(fb, 0, 0, 128, 16, COLOR_MAGENTA);
+        draw_string_centered(fb, 4, "AUDIO RECORDER", COLOR_BLACK, 1);
+        draw_string_centered(fb, 26, disp_name, COLOR_WHITE, 2);
+        if (disp_num[0]) draw_string_centered(fb, 46, disp_num, COLOR_CYAN, 1);
+        if (call_state == 2) draw_string_centered(fb, 62, dur_str, COLOR_YELLOW, 2);
+        draw_string_centered(fb, 82, "TAPE: SIDE A", COLOR_CYAN, 1);
+        fill_rect(fb, 6, 96, 116, 16, COLOR_CYAN);
+        draw_string_centered(fb, 100, "PTT: PLAY / REC", COLOR_BLACK, 1);
+
+    } else if (strcmp(theme, "target") == 0 || strcmp(theme, "encrypted") == 0) {
+        fill_rect(fb, 0, 0, 128, 16, COLOR_PIP_GREEN);
+        draw_string_centered(fb, 4, "SECURE COMMS [AES-256]", COLOR_BLACK, 1);
+        draw_string_centered(fb, 24, disp_name, COLOR_PIP_LIGHT, 2);
+        if (disp_num[0]) draw_string_centered(fb, 44, disp_num, COLOR_PIP_GREEN, 1);
+        if (call_state == 2) draw_string_centered(fb, 58, dur_str, COLOR_WHITE, 2);
+        draw_string_centered(fb, 76, "FREQ: 144.825 MHz", COLOR_PIP_GREEN, 1);
+        fill_rect(fb, 6, 92, 116, 16, COLOR_PIP_DARK);
+        draw_rect(fb, 6, 92, 116, 16, COLOR_PIP_GREEN);
+        draw_string_centered(fb, 96, "ENCRYPTED LINK", COLOR_PIP_GREEN, 1);
+        draw_string_centered(fb, 114, "MIL-SPEC SECURE", COLOR_GRAY_LIGHT, 1);
+
+    } else if (strcmp(theme, "starfleet") == 0) {
+        fill_rect(fb, 0, 0, 16, 128, COLOR_AMBER);
+        fill_rect(fb, 16, 0, 112, 14, COLOR_AMBER_BRIGHT);
+        draw_string(fb, 20, 3, "SUBSPACE AUDIO", COLOR_BLACK, 1);
+        draw_string(fb, 22, 24, disp_name, COLOR_WHITE, 2);
+        if (disp_num[0]) draw_string(fb, 22, 44, disp_num, COLOR_AMBER, 1);
+        if (call_state == 2) draw_string(fb, 22, 60, dur_str, COLOR_YELLOW, 2);
+        draw_string(fb, 22, 82, "HAILING FREQ", COLOR_PURPLE, 1);
+        draw_string(fb, 22, 98, "AUDIO CHANNEL ON", COLOR_CYAN, 1);
+        draw_string(fb, 22, 114, "LCARS STARFLEET", COLOR_AMBER, 1);
+
+    } else if (strcmp(theme, "pager") == 0) {
+        fill_rect(fb, 0, 0, 128, 128, COLOR_GRAY_LIGHT);
+        draw_string(fb, 4, 4, "PAGE 01 [URGENT]", COLOR_BLACK, 1);
+        draw_string_centered(fb, 26, disp_name, COLOR_BLACK, 2);
+        if (disp_num[0]) draw_string_centered(fb, 46, disp_num, COLOR_BLACK, 1);
+        if (call_state == 2) draw_string_centered(fb, 62, dur_str, COLOR_BLACK, 2);
+        draw_string_centered(fb, 84, "MSG: CALL STAT", COLOR_BLACK, 1);
+        draw_string_centered(fb, 106, "MOTOROLA 90S", COLOR_BLACK, 1);
+
+    } else if (strcmp(theme, "mi6") == 0) {
+        fill_rect(fb, 0, 0, 128, 16, COLOR_BLUE);
+        draw_string_centered(fb, 4, "TRANSMISSION FROM M", COLOR_WHITE, 1);
+        draw_string_centered(fb, 26, disp_name, COLOR_WHITE, 2);
+        if (disp_num[0]) draw_string_centered(fb, 46, disp_num, COLOR_CYAN, 1);
+        if (call_state == 2) draw_string_centered(fb, 62, dur_str, COLOR_WHITE, 2);
+        draw_string_centered(fb, 82, "PRIORITY 1 DISPATCH", COLOR_YELLOW, 1);
+        fill_rect(fb, 6, 96, 116, 16, COLOR_BLUE);
+        draw_string_centered(fb, 100, "DECODE SATELLITE", COLOR_WHITE, 1);
+
+    } else if (strcmp(theme, "minimal") == 0) {
+        draw_string_centered(fb, 6, call_state == 1 ? "INCOMING CALL" : "ACTIVE CALL", COLOR_GRAY_LIGHT, 1);
+        draw_string_centered(fb, 28, disp_name, COLOR_WHITE, 2);
+        if (disp_num[0]) draw_string_centered(fb, 48, disp_num, COLOR_GRAY_LIGHT, 1);
+        if (call_state == 2) draw_string_centered(fb, 68, dur_str, COLOR_WHITE, 2);
+        draw_string_centered(fb, 94, "PTT: ANSWER / HANGUP", COLOR_WHITE, 1);
+        draw_string_centered(fb, 112, "RED KEY: REJECT", COLOR_GRAY_LIGHT, 1);
+
+    } else {
+        /* Pip-Boy Incoming & Active HUD (Default) */
+        if (call_state == 1) {
+            fill_rect(fb, 0, 0, 128, 14, COLOR_AMBER);
+            draw_string_centered(fb, 3, "> TRANSMISSION <", COLOR_BLACK, 1);
+            draw_string_centered(fb, 20, "INCOMING CALL", COLOR_PIP_GREEN, 1);
+            draw_string_centered(fb, 34, disp_name, COLOR_WHITE, 2);
+            if (disp_num[0]) draw_string_centered(fb, 52, disp_num, COLOR_PIP_LIGHT, 1);
+            draw_string_centered(fb, 68, "SIG: [||||||||||] 98%", COLOR_PIP_LIGHT, 1);
+            fill_rect(fb, 6, 84, 116, 16, COLOR_PIP_GREEN);
+            draw_string_centered(fb, 88, "HOLD [PTT]: ANSWER SPK", COLOR_BLACK, 1);
+            draw_string_centered(fb, 108, "RED KEY: REJECT", COLOR_RED, 1);
+        } else {
+            fill_rect(fb, 0, 0, 128, 14, COLOR_PIP_GREEN);
+            draw_string(fb, 4, 3, "COMM ACTIVE", COLOR_BLACK, 1);
+            draw_string(fb, 78, 3, "SPK:ON", COLOR_BLACK, 1);
+            draw_string_centered(fb, 20, disp_name, COLOR_WHITE, 2);
+            if (disp_num[0]) draw_string_centered(fb, 38, disp_num, COLOR_PIP_LIGHT, 1);
+            draw_string_centered(fb, 52, dur_str, COLOR_WHITE, 3);
+            draw_rect(fb, 6, 96, 116, 16, COLOR_RED);
+            draw_string_centered(fb, 101, "HOLD [PTT]: END CALL", COLOR_RED, 1);
         }
     }
-    pclose(fp);
-    return call_state;
-}
-
-/* === Drawing Pip-Boy Icons === */
-static void draw_cellular_icon(uint32_t *fb, int x, int y, uint32_t color) {
-    // 4 ascending signal bars
-    fill_rect(fb, x, y + 6, 2, 2, color);
-    fill_rect(fb, x + 3, y + 4, 2, 4, color);
-    fill_rect(fb, x + 6, y + 2, 2, 6, color);
-    fill_rect(fb, x + 9, y, 2, 8, color);
-}
-
-static void draw_wifi_icon(uint32_t *fb, int x, int y, uint32_t color, int active) {
-    if (!active) {
-        draw_string(fb, x, y + 1, "xWF", COLOR_PIP_DARK, 1);
-        return;
-    }
-    // 3 concentric wave arcs + center dot
-    draw_hline(fb, x + 1, y, 7, color);
-    draw_hline(fb, x + 2, y + 2, 5, color);
-    draw_hline(fb, x + 3, y + 4, 3, color);
-    draw_pixel(fb, x + 4, y + 6, color);
-}
-
-static void draw_hotspot_icon(uint32_t *fb, int x, int y, uint32_t color, int active) {
-    if (!active) return;
-    // Broadcast beacon tower
-    draw_pixel(fb, x + 4, y + 1, color);
-    draw_pixel(fb, x + 3, y + 2, color);
-    draw_pixel(fb, x + 5, y + 2, color);
-    draw_pixel(fb, x + 2, y + 3, color);
-    draw_pixel(fb, x + 6, y + 3, color);
-    fill_rect(fb, x + 4, y + 3, 1, 5, color);
-}
-
-static void draw_telemetry_gauge(uint32_t *fb, int y, const char *label, int pct) {
-    draw_string(fb, 4, y, label, COLOR_PIP_LIGHT, 1);
-
-    int total_segs = 10;
-    int filled = (pct * total_segs) / 100;
-    if (filled > total_segs) filled = total_segs;
-    if (filled < 0) filled = 0;
-
-    int bar_x = 32;
-    for (int s = 0; s < total_segs; s++) {
-        uint32_t seg_color = (s < filled) ? COLOR_PIP_GREEN : COLOR_PIP_DARK;
-        fill_rect(fb, bar_x + s * 6, y, 4, 7, seg_color);
-    }
-
-    char val_buf[8];
-    snprintf(val_buf, sizeof(val_buf), "%3d%%", pct);
-    draw_string(fb, 98, y, val_buf, COLOR_PIP_LIGHT, 1);
 }
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
-    log_open();
-    outerlog("outerscreen_service starting up (Cat S22 FLIP Pip-Boy HUD)");
-
-    /* Acquire kernel wake lock IMMEDIATELY to prevent SPI bus power gating.
-     * This must happen before opening fb2, as DOZE can gate the SPI bus.
-     * Re-acquire every loop iteration to survive any kernel wake lock timeouts. */
     acquire_wakelock();
-    outerlog("wake lock acquired, opening fb2");
 
     int fb_fd = open(FB_DEV, O_RDWR);
-    if (fb_fd < 0) { outerlog("ERROR: cannot open fb2"); return 1; }
-    outerlog("fb2 opened OK");
+    if (fb_fd < 0) return 1;
 
     struct fb_var_screeninfo vinfo;
     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo)) {
-        outerlog("ERROR: FBIOGET_VSCREENINFO failed");
         close(fb_fd);
         return 1;
     }
@@ -580,28 +747,19 @@ int main(void) {
     size_t screensize = 128 * 128 * 4;
     uint32_t *fb = (uint32_t *)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
     if (fb == MAP_FAILED) {
-        outerlog("ERROR: mmap failed");
         close(fb_fd);
         return 1;
     }
 
-    int last_call_state = 0;
     int call_state = 0;
     char incoming_num[64] = {0};
+    char contact_name[64] = {0};
+    char last_resolved_num[64] = {0};
     time_t call_start_time = 0;
-    int anim_tick = 0;
     unsigned long loop_count = 0;
 
-    /* Prime the live log buffer */
-    live_log[0][0] = '\0';
-    live_log[1][0] = '\0';
-
-    outerlog("entering main display loop");
-
-    /* FULL TIME ALWAYS-ON REFRESH LOOP */
     for (;;) {
         loop_count++;
-
         load_outer_config();
 
         if (!cfg_outer_enabled) {
@@ -609,184 +767,52 @@ int main(void) {
             clear_screen(fb);
             vinfo.yoffset = 0;
             ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
-            int hbfd = open("/dev/shm_outerscreen_heartbeat", O_CREAT | O_WRONLY | O_TRUNC, 0666);
-            if (hbfd >= 0) close(hbfd);
             sleep(1);
             continue;
         }
 
-        // Enforce configured backlight every second so display never sleeps or dims
-        set_backlight(255);
+        set_backlight(cfg_outer_brightness);
         ioctl(fb_fd, FBIOBLANK, FB_BLANK_UNBLANK);
-
         clear_screen(fb);
 
-        /* Poll telephony every 2s when idle, or every 1s when ringing/in-call */
+        /* Telephony */
         if (call_state != 0 || loop_count % 2 == 1) {
             call_state = poll_telephony(incoming_num, sizeof(incoming_num));
         }
 
-        /* Log call state transitions */
-        if (call_state != last_call_state) {
-            outerlog("call state: %d -> %d (num=%s)", last_call_state, call_state, incoming_num[0] ? incoming_num : "none");
-        }
-
-        /* Update live logcat tail every 10 seconds (only when idle & logcat mode) */
-        if (call_state == 0 && strcmp(cfg_outer_footer, "logcat") == 0 && (loop_count == 1 || loop_count % 10 == 0)) {
-            poll_live_log();
-        }
-
-        if (call_state == 1) {
-            /* === PIP-BOY INCOMING TRANSMISSION HUD === */
-            fill_rect(fb, 0, 0, 128, 14, COLOR_AMBER);
-            draw_string_centered(fb, 3, "> TRANSMISSION <", COLOR_BLACK, 1);
-
-            draw_string_centered(fb, 22, "INCOMING COMMS", COLOR_PIP_GREEN, 1);
-
-            char num_display[32];
-            if (incoming_num[0]) {
-                snprintf(num_display, sizeof(num_display), "%.15s", incoming_num);
+        if (call_state > 0) {
+            if (incoming_num[0] && strcmp(incoming_num, last_resolved_num) != 0) {
+                lookup_contact_name(incoming_num, contact_name, sizeof(contact_name));
+                snprintf(last_resolved_num, sizeof(last_resolved_num), "%s", incoming_num);
+            }
+            if (call_state == 2) {
+                if (call_start_time == 0) call_start_time = time(NULL);
             } else {
-                snprintf(num_display, sizeof(num_display), "UNKNOWN CALLER");
+                call_start_time = 0;
             }
-            draw_string_centered(fb, 40, num_display, COLOR_WHITE, 2);
-
-            draw_string_centered(fb, 62, "SIG: [||||||||||] 98%", COLOR_PIP_LIGHT, 1);
-
-            fill_rect(fb, 6, 82, 116, 16, COLOR_PIP_GREEN);
-            draw_string_centered(fb, 86, "HOLD [PTT]: ANSWER SPK", COLOR_BLACK, 1);
-
-            draw_string_centered(fb, 108, "RED KEY: REJECT", COLOR_RED, 1);
-            call_start_time = 0;
-
-        } else if (call_state == 2) {
-            /* === PIP-BOY ACTIVE COMMS LINK HUD === */
-            if (last_call_state != 2 || call_start_time == 0) {
-                call_start_time = time(NULL);
-            }
-            long call_duration = (long)(time(NULL) - call_start_time);
-            if (call_duration < 0) call_duration = 0;
-
-            fill_rect(fb, 0, 0, 128, 14, COLOR_PIP_GREEN);
-            draw_string(fb, 4, 3, "COMM ACTIVE", COLOR_BLACK, 1);
-            draw_string(fb, 78, 3, "SPK:ON", COLOR_BLACK, 1);
-
-            draw_string_centered(fb, 20, "TRANSMISSION TIME", COLOR_PIP_DARK, 1);
-
-            char timer_buf[32];
-            snprintf(timer_buf, sizeof(timer_buf), "%02ld:%02ld", call_duration / 60, call_duration % 60);
-            draw_string_centered(fb, 32, timer_buf, COLOR_WHITE, 3);
-
-            // Animated Equalizer Wave
-            int eq_bars[] = {4, 12, 18, 8, 16, 22, 14, 10, 20, 6, 14, 8};
-            int count = sizeof(eq_bars) / sizeof(eq_bars[0]);
-            int base_y = 82;
-            for (int b = 0; b < count; b++) {
-                int h = eq_bars[(b + anim_tick) % count];
-                fill_rect(fb, 16 + b * 8, base_y - h / 2, 4, h, COLOR_PIP_GREEN);
-            }
-
-            draw_rect(fb, 6, 100, 116, 18, COLOR_RED);
-            draw_string_centered(fb, 105, "HOLD [PTT]: END CALL", COLOR_RED, 1);
-
+            long dur = call_start_time > 0 ? (long)(time(NULL) - call_start_time) : 0;
+            render_call_hud(fb, cfg_outer_call, call_state, incoming_num, contact_name, dur);
         } else {
-            /* === Cat S22 FLIP PIP-BOY HUD WATCHFACE (ALWAYS-ON FULL TIME) === */
             call_start_time = 0;
-
+            last_resolved_num[0] = '\0';
+            contact_name[0] = '\0';
             time_t now = time(NULL);
             struct tm *tm_info = localtime(&now);
-
-            // 1. TOP WIRELESS STATUS BAR
-            int wifi_on = is_wifi_connected();
-            int hotspot_on = is_hotspot_active();
-
-            draw_cellular_icon(fb, 4, 3, COLOR_PIP_GREEN);
-            draw_wifi_icon(fb, 20, 3, COLOR_PIP_GREEN, wifi_on);
-            draw_hotspot_icon(fb, 36, 3, COLOR_AMBER, hotspot_on);
-
-            /* Title: "Cat S22 FLIP" */
-            draw_string(fb, 50, 3, "Cat S22 FLIP", COLOR_PIP_LIGHT, 1);
-            draw_hline(fb, 2, 14, 124, COLOR_PIP_DARK);
-
-            // 2. CENTER HIGH-CONTRAST DIGITAL CLOCK
-            char time_buf[16];
-            strftime(time_buf, sizeof(time_buf), "%H:%M", tm_info);
-            draw_string(fb, 10, 20, time_buf, COLOR_WHITE, 3);
-
-            // Seconds Pill
-            char sec_buf[8];
-            snprintf(sec_buf, sizeof(sec_buf), ":%02d", tm_info->tm_sec);
-            draw_string(fb, 102, 32, sec_buf, COLOR_PIP_GREEN, 1);
-
-            // Date Badge
-            char date_buf[32];
-            strftime(date_buf, sizeof(date_buf), "%a %d-%b-%Y", tm_info);
-            for (int i = 0; date_buf[i]; i++) if (date_buf[i] >= 'a' && date_buf[i] <= 'z') date_buf[i] -= 32;
-            draw_string_centered(fb, 46, date_buf, COLOR_PIP_LIGHT, 1);
-            draw_hline(fb, 2, 56, 124, COLOR_PIP_DARK);
-
-            // 3. TELEMETRY GAUGES: BAT%, CPU%, RAM%
             int bat = get_battery();
             int cpu = get_cpu_usage();
             int ram = get_ram_usage();
-
-            draw_telemetry_gauge(fb, 62, "BAT", bat >= 0 ? bat : 0);
-            draw_telemetry_gauge(fb, 76, "CPU", cpu);
-            draw_telemetry_gauge(fb, 90, "RAM", ram);
-
-            // 4. FOOTER: Estimated Battery Life, Live logcat tail, or Pip-Boy Status
-            draw_hline(fb, 2, 102, 124, COLOR_PIP_DARK);
-            if (strcmp(cfg_outer_footer, "battery") == 0) {
-                char bat_l1[32] = {0}, bat_l2[32] = {0};
-                get_battery_estimate(bat >= 0 ? bat : 0, cpu, bat_l1, sizeof(bat_l1), bat_l2, sizeof(bat_l2));
-                draw_string(fb, 2, 105, bat_l1, COLOR_PIP_GREEN, 1);
-                draw_string(fb, 2, 114, bat_l2, COLOR_PIP_LIGHT, 1);
-            } else if (strcmp(cfg_outer_footer, "status") == 0) {
-                draw_string(fb, 4, 105, "> SYS:ONLINE  LTE:OK", COLOR_PIP_GREEN, 1);
-                draw_string(fb, 4, 114, "> VAULT-TEC CAT-S22", COLOR_PIP_LIGHT, 1);
-            } else if (strcmp(cfg_outer_footer, "logcat") == 0) {
-                /* Line 1: y=105, Line 2: y=114 — 1px font, 9px row pitch */
-                if (live_log[0][0]) {
-                    draw_string(fb, 2, 105, live_log[0], COLOR_PIP_GREEN, 1);
-                } else {
-                    draw_string(fb, 2, 105, "> SYS:IDLE", COLOR_PIP_DARK, 1);
-                }
-                if (live_log[1][0]) {
-                    draw_string(fb, 2, 114, live_log[1], COLOR_PIP_GREEN, 1);
-                } else {
-                    draw_string(fb, 2, 114, "> ...", COLOR_PIP_DARK, 1);
-                }
-            }
+            render_watchface(fb, cfg_outer_theme, tm_info, bat, cpu, ram);
         }
 
-        last_call_state = call_state;
-        anim_tick++;
-
-        /* Periodic log: every 60s log a status heartbeat */
-        if (loop_count % 60 == 0) {
-            outerlog("alive: loop=%lu call=%d", loop_count, call_state);
-        }
-
-        // Update watchdog heartbeat timestamp
-        int hbfd = open("/dev/shm_outerscreen_heartbeat", O_CREAT | O_WRONLY | O_TRUNC, 0666);
-        if (hbfd >= 0) close(hbfd);
-
-        /* Re-acquire wake lock every cycle to keep SPI bus powered.
-         * FBIOPAN_DISPLAY is intentionally NOT called here:
-         * The SPI panel driver (panel type=13, mdss_spi_client spi6.0) has no DMA
-         * function set, causing msm_spi_process_transfer SPI Tx transaction timeouts
-         * which reset the panel and cause white/blank flicker.
-         * We use FBIOPUT_VSCREENINFO only (triggers SPI pixel push via software path). */
-        acquire_wakelock();
         vinfo.yoffset = 0;
         ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
-        ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
+
+        /* Touch heartbeat file */
+        int hbfd = open("/dev/shm_outerscreen_heartbeat", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (hbfd >= 0) close(hbfd);
 
         sleep(1);
     }
 
-    munmap(fb, screensize);
-    close(fb_fd);
-    if (g_log_fp) fclose(g_log_fp);
     return 0;
 }

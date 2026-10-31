@@ -31,8 +31,24 @@
         <SwitchPreference
             android:key="outer_enabled"
             android:title="Outer Display Enabled"
-            android:summary="Keep Pip-Boy HUD active on the external display"
+            android:summary="Keep HUD active on the external display"
             android:defaultValue="true" />
+
+        <ListPreference
+            android:key="outer_theme"
+            android:title="Watchface Theme"
+            android:summary="%s"
+            android:entries="@array/outer_theme_entries"
+            android:entryValues="@array/outer_theme_values"
+            android:defaultValue="pipboy" />
+
+        <ListPreference
+            android:key="outer_call_theme"
+            android:title="Call UI Theme"
+            android:summary="%s"
+            android:entries="@array/outer_call_entries"
+            android:entryValues="@array/outer_call_values"
+            android:defaultValue="pipboy" />
 
         <ListPreference
             android:key="outer_footer"
