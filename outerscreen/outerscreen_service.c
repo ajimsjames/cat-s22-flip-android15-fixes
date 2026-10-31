@@ -804,8 +804,10 @@ int main(void) {
             render_watchface(fb, cfg_outer_theme, tm_info, bat, cpu, ram);
         }
 
+        acquire_wakelock();
         vinfo.yoffset = 0;
         ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
+        ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
 
         /* Touch heartbeat file */
         int hbfd = open("/dev/shm_outerscreen_heartbeat", O_CREAT | O_WRONLY | O_TRUNC, 0666);
