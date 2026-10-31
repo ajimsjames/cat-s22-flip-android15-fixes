@@ -124,3 +124,178 @@ adb reboot fastboot
 fastboot flash super /path/to/output_super.img
 fastboot reboot
 ```
+---
+
+## 🎨 Developer Guide: Creating UI Themes for the Cat S22 Flip Outer OLED Display
+
+The Cat S22 Flip features a secondary external **128×128 pixel** monochromatic/color OLED panel driven over SPI via the secondary Qualcomm MDSS framebuffer device: `/dev/graphics/fb2`.
+
+This guide documents the architecture, framebuffer specifications, color constraints, font engine, and step-by-step instructions for adding custom **Watchfaces** and **Call HUDs**.
+
+---
+
+### 1. Hardware & Framebuffer Specifications
+
+| Property | Value | Notes |
+| :--- | :--- | :--- |
+| **Device Node** | `/dev/graphics/fb2` | Direct Linux Framebuffer |
+| **Resolution** | **128 × 128** pixels | 1:1 Square Aspect Ratio |
+| **Color Format** | `ARGB8888` (32-bit Little Endian) | `0xAARRGGBB` |
+| **Total Buffer Size** | 65,536 Bytes (`128 * 128 * 4`) | Memory-mapped via `mmap()` |
+| **Backlight Sysfs** | `/sys/class/leds/lcd-backlight2/brightness` | `0` (Off) to `255` (Max) |
+| **SPI Power Lock** | `/sys/power/wake_lock` | Write `"outerscreen_wakelock\n"` to prevent DOZE SPI sleep |
+
+> [!CAUTION]
+> **Alpha Channel Rule (0xFF Alpha Mandatory):**
+> The Qualcomm MDSS display controller interprets `0x00` in the high byte as full transparency / inverted white background. Every 32-bit pixel written to `/dev/graphics/fb2` **MUST** have its alpha byte set to `0xFF` (e.g. `0xFF000000 | (r << 16) | (g << 8) | b`). Failing to do so causes full-screen white inversion.
+
+---
+
+### 2. Palette & Color Definitions
+
+Always use 32-bit ARGB constants:
+
+```c
+#define COLOR_BLACK         0xFF000000
+#define COLOR_WHITE         0xFFFFFFFF
+#define COLOR_PIP_GREEN     0xFF10B981   /* Vault-Tec Phosphor Green */
+#define COLOR_PIP_LIGHT     0xFFA7F3D0   /* Mint Green Glow */
+#define COLOR_PIP_DARK      0xFF064E3B   /* Dim Segment Green */
+#define COLOR_AMBER         0xFFF59E0B   /* Amber CRT Warning */
+#define COLOR_AMBER_BRIGHT  0xFFFBBF24   /* High-Intensity Amber */
+#define COLOR_RED           0xFFEF4444   /* Danger / Alert Red */
+#define COLOR_CYAN          0xFF06B6D4   /* Cyberpunk / VoLTE Cyan */
+#define COLOR_MAGENTA       0xFFEC4899   /* 80s Synthwave Magenta */
+#define COLOR_PURPLE        0xFFA855F7   /* Deep Violet */
+#define COLOR_YELLOW        0xFFEAB308   /* CAT Heavy Equipment Yellow */
+#define COLOR_GRAY_LIGHT    0xFF94A3B8   /* Casio LCD Gray */
+```
+
+---
+
+### 3. Core Drawing Primitives
+
+The rendering engine operates directly in RAM on the mmap'd pointer `uint32_t *fb`:
+
+#### Drawing a Single Pixel:
+```c
+static void draw_pixel(uint32_t *fb, int x, int y, uint32_t color) {
+    if (x >= 0 && x < 128 && y >= 0 && y < 128) {
+        fb[y * 128 + x] = color;
+    }
+}
+```
+
+#### Drawing Solid Rectangles:
+```c
+static void fill_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
+    for (int cy = y; cy < y + h && cy < 128; cy++) {
+        if (cy < 0) continue;
+        for (int cx = x; cx < x + w && cx < 128; cx++) {
+            if (cx >= 0) fb[cy * 128 + cx] = color;
+        }
+    }
+}
+```
+
+#### Outlined Rectangles:
+```c
+static void draw_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
+    for (int cx = x; cx < x + w; cx++) { draw_pixel(fb, cx, y, color); draw_pixel(fb, cx, y + h - 1, color); }
+    for (int cy = y; cy < y + h; cy++) { draw_pixel(fb, x, cy, color); draw_pixel(fb, x + w - 1, cy, color); }
+}
+```
+
+---
+
+### 4. Typography & Font Engine
+
+The outer display uses an embedded **5×7 ASCII bitmapped font** table:
+- **`scale = 1`**: 5×7 pixels per glyph, 6px pitch (ideal for telemetry, labels, and footer text; fits 21 characters across the 128px screen).
+- **`scale = 2`**: 10×14 pixels per glyph, 12px pitch (ideal for caller names, stardates, subheadings).
+- **`scale = 3`**: 15×21 pixels per glyph, 18px pitch (ideal for main digital clock and call duration timer).
+
+#### Centered Text Routine:
+```c
+static void draw_string_centered(uint32_t *fb, int y, const char *str, uint32_t color, int scale) {
+    int len = strlen(str);
+    int w = len * 6 * scale - scale;
+    int x = (128 - w) / 2;
+    if (x < 0) x = 0;
+    draw_string(fb, x, y, str, color, scale);
+}
+```
+
+---
+
+### 5. Step-by-Step: Adding a New Watchface Theme
+
+1. **Choose a Unique Identifier**:
+   E.g., `my_theme`
+2. **Add Preference to `catparts`**:
+   In `catparts/res/values/strings.xml`:
+   ```xml
+   <!-- Under outer_theme_entries -->
+   <item>23. My Cool Custom Theme</item>
+
+   <!-- Under outer_theme_values -->
+   <item>my_theme</item>
+   ```
+3. **Implement Rendering in `outerscreen/outerscreen_service.c`**:
+   Inside `render_watchface()`:
+   ```c
+   else if (strcmp(theme, "my_theme") == 0) {
+       draw_status_bar(fb, "MY THEME", COLOR_WHITE, bat);
+       draw_string_centered(fb, 26, time_str, COLOR_CYAN, 3);
+       draw_string_centered(fb, 56, date_str, COLOR_PIP_LIGHT, 1);
+       char info[32];
+       snprintf(info, sizeof(info), "CPU:%d%%  RAM:%d%%", cpu, ram);
+       draw_string_centered(fb, 76, info, COLOR_AMBER, 1);
+       fill_rect(fb, 14, 96, (bat * 100) / 100, 6, COLOR_PIP_GREEN);
+       draw_rect(fb, 14, 96, 100, 6, COLOR_GRAY);
+       draw_string_centered(fb, 112, "BATTERY STATUS", COLOR_WHITE, 1);
+   }
+   ```
+
+---
+
+### 6. Step-by-Step: Adding a New Call UI HUD
+
+1. **Choose a Call Identifier**:
+   E.g., `my_call`
+2. **Add Preference to `catparts`**:
+   In `catparts/res/values/strings.xml` under `outer_call_entries` and `outer_call_values`.
+3. **Implement in `render_call_hud()`**:
+   ```c
+   else if (strcmp(theme, "my_call") == 0) {
+       fill_rect(fb, 0, 0, 128, 16, COLOR_CYAN);
+       draw_string_centered(fb, 4, call_state == 1 ? "INCOMING CALL" : "CALL ACTIVE", COLOR_BLACK, 1);
+       draw_string_centered(fb, 24, disp_name, COLOR_WHITE, 2);
+       if (disp_num[0]) draw_string_centered(fb, 44, disp_num, COLOR_CYAN, 1);
+       if (call_state == 2) draw_string_centered(fb, 60, dur_str, COLOR_YELLOW, 2);
+       fill_rect(fb, 6, 92, 116, 16, COLOR_PIP_GREEN);
+       draw_string_centered(fb, 96, call_state == 1 ? "PTT: ANSWER" : "PTT: END", COLOR_BLACK, 1);
+   }
+   ```
+4. **Compile as 32-bit ARM Dynamic Binary**:
+   ```bash
+   armv7a-linux-androideabi21-clang -O2 -Wall -Wextra \
+     outerscreen/outerscreen_service.c -o outerscreen/outerscreen_service
+   ```
+
+---
+
+### 7. Telephony & Contact Name Lookup Architecture
+
+`outerscreen_service` monitors phone state via `dumpsys telephony.registry`:
+- `mCallState=1` / `mRingingCallState=1`: Incoming Ringing
+- `mCallState=2` / `mForegroundCallState=1`: Active In-Call
+- `mCallIncomingNumber`: Phone number string
+
+When a call is detected, the daemon automatically queries Android's Contacts Provider:
+```bash
+content query --uri content://com.android.contacts/phone_lookup/<phone_number> --projection display_name
+```
+If a matched contact exists, `disp_name` is populated with the contact's name (e.g. `JOHN DOE`). Otherwise, the raw phone number is displayed.
+
+---
